@@ -30,7 +30,9 @@ impl<T> RpcEnvelope<T> {
 pub enum ClientRequest {
     GetStatus,
     WatchStatus { interval_ms: u64 },
+    WatchSessions { interval_ms: u64 },
     StartSession { relying_party: String },
+    SubmitPin { session_id: Uuid, pin: String },
     CancelSession { session_id: Uuid },
 }
 
@@ -38,9 +40,28 @@ pub enum ClientRequest {
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum DaemonResponse {
     Status(DaemonStatus),
-    SessionStarted { session_id: Uuid },
+    SessionStarted {
+        session_id: Uuid,
+        state: SessionState,
+    },
+    SessionUpdated {
+        session_id: Uuid,
+        state: SessionState,
+        error: Option<String>,
+    },
     SessionCancelled { session_id: Uuid },
     Error { code: String, message: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SessionState {
+    Idle,
+    Active,
+    PinEntry,
+    CardInteraction,
+    Completed,
+    Error,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

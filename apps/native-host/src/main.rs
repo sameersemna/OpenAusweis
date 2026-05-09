@@ -8,10 +8,12 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tokio::time::{timeout, Duration};
 use url::Url;
 use uuid::Uuid;
 
 const DAEMON_SOCKET_PATH: &str = "/tmp/openausweis-daemon.sock";
+const WATCH_SESSIONS_FIRST_EVENT_TIMEOUT_MS: u64 = 4500;
 
 const DEFAULT_ALLOWED_EXACT_ORIGINS: &[&str] = &["http://localhost", "https://localhost"];
 const DEFAULT_ALLOWED_SUFFIXES: &[&str] = &[".bundid.de", ".bund.de"];
@@ -364,6 +366,8 @@ fn read_native_message(reader: &mut impl Read) -> Result<Option<Vec<u8>>> {
 async fn forward_to_daemon(
     request: RpcEnvelope<ClientRequest>,
 ) -> Result<RpcEnvelope<DaemonResponse>> {
+    let wait_for_first_event = matches!(&request.payload, ClientRequest::WatchSessions { .. });
+
     let stream = UnixStream::connect(DAEMON_SOCKET_PATH)
         .await
         .with_context(|| format!("failed to connect to daemon socket at {DAEMON_SOCKET_PATH}"))?;
@@ -381,11 +385,22 @@ async fn forward_to_daemon(
         .await
         .context("failed to write daemon request newline")?;
 
-    let line = daemon_lines
-        .next_line()
+    let line = if wait_for_first_event {
+        timeout(
+            Duration::from_millis(WATCH_SESSIONS_FIRST_EVENT_TIMEOUT_MS),
+            daemon_lines.next_line(),
+        )
         .await
+        .context("timed out while waiting for session stream event")?
         .context("failed to read daemon response")?
-        .ok_or_else(|| anyhow::anyhow!("daemon closed connection before responding"))?;
+        .ok_or_else(|| anyhow::anyhow!("daemon closed connection before responding"))?
+    } else {
+        daemon_lines
+            .next_line()
+            .await
+            .context("failed to read daemon response")?
+            .ok_or_else(|| anyhow::anyhow!("daemon closed connection before responding"))?
+    };
 
     let response: RpcEnvelope<DaemonResponse> =
         serde_json::from_str(&line).context("failed to parse daemon response")?;

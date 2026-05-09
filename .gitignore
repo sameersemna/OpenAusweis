@@ -56,3 +56,4 @@ apps/desktop/src/*.js
 *.pem
 *.key
 *.crt
+*.prs

@@ -1,7 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use anyhow::{Context, Result};
-use openausweis_ipc::{ClientRequest, DaemonResponse, RpcEnvelope, IPC_PROTOCOL_VERSION};
+use openausweis_ipc::{
+    ClientRequest, DaemonResponse, RpcEnvelope, SessionState, IPC_PROTOCOL_VERSION,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
@@ -18,8 +20,11 @@ use uuid::Uuid;
 
 const DAEMON_SOCKET_PATH: &str = "/tmp/openausweis-daemon.sock";
 const DAEMON_STATUS_EVENT: &str = "daemon-status";
+const DAEMON_SESSION_EVENT: &str = "daemon-session";
 const DAEMON_STATUS_STREAM_INTERVAL_MS: u64 = 1000;
+const DAEMON_SESSION_STREAM_INTERVAL_MS: u64 = 500;
 const DAEMON_STATUS_RECONNECT_DELAY_MS: u64 = 1500;
+const DAEMON_SESSION_RECONNECT_DELAY_MS: u64 = 1500;
 const DEFAULT_ALLOWED_EXACT_ORIGINS: &[&str] = &["http://localhost", "https://localhost"];
 const DEFAULT_ALLOWED_SUFFIXES: &[&str] = &[".bundid.de", ".bund.de"];
 
@@ -42,6 +47,15 @@ struct DesktopReaderStatus {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopSessionUpdate {
+    connected: bool,
+    session_id: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OriginPolicyPayload {
@@ -52,6 +66,71 @@ struct OriginPolicyPayload {
 #[tauri::command]
 async fn probe_daemon_status() -> std::result::Result<DesktopDaemonStatus, String> {
     get_daemon_status().await.map_err(|err| format!("{err}"))
+}
+
+#[tauri::command]
+async fn start_test_session() -> std::result::Result<DesktopSessionUpdate, String> {
+    let response = send_unary_daemon_request(ClientRequest::StartSession {
+        relying_party: "https://localhost".to_string(),
+    })
+    .await
+    .map_err(|err| format!("{err}"))?;
+
+    match response {
+        DaemonResponse::SessionStarted { session_id, state } => Ok(DesktopSessionUpdate {
+            connected: true,
+            session_id: Some(session_id.to_string()),
+            state: Some(session_state_wire_value(state).to_string()),
+            error: None,
+        }),
+        DaemonResponse::Error { code, message } => Err(format!("daemon error {code}: {message}")),
+        other => Err(format!("unexpected daemon response: {other:?}")),
+    }
+}
+
+#[tauri::command]
+async fn submit_session_pin(session_id: String, pin: String) -> std::result::Result<DesktopSessionUpdate, String> {
+    let session_id = Uuid::parse_str(&session_id)
+        .with_context(|| format!("invalid session id: {session_id}"))
+        .map_err(|err| format!("{err}"))?;
+
+    let response = send_unary_daemon_request(ClientRequest::SubmitPin { session_id, pin })
+        .await
+        .map_err(|err| format!("{err}"))?;
+
+    match response {
+        DaemonResponse::SessionUpdated {
+            session_id,
+            state,
+            error,
+        } => Ok(DesktopSessionUpdate {
+            connected: true,
+            session_id: Some(session_id.to_string()),
+            state: Some(session_state_wire_value(state).to_string()),
+            error,
+        }),
+        DaemonResponse::Error { code, message } => Err(format!("daemon error {code}: {message}")),
+        other => Err(format!("unexpected daemon response: {other:?}")),
+    }
+}
+
+#[tauri::command]
+async fn cancel_session(session_id: String) -> std::result::Result<(), String> {
+    let session_id = Uuid::parse_str(&session_id)
+        .with_context(|| format!("invalid session id: {session_id}"))
+        .map_err(|err| format!("{err}"))?;
+
+    let response = send_unary_daemon_request(ClientRequest::CancelSession { session_id })
+        .await
+        .map_err(|err| format!("{err}"))?;
+
+    match response {
+        DaemonResponse::SessionCancelled { .. } => Ok(()),
+        DaemonResponse::Error { code, message } => {
+            Err(format!("daemon error {code}: {message}"))
+        }
+        other => Err(format!("unexpected daemon response: {other:?}")),
+    }
 }
 
 #[tauri::command]
@@ -309,6 +388,16 @@ fn validate_policy(policy: &OriginPolicyPayload) -> Result<()> {
 }
 
 async fn get_daemon_status() -> Result<DesktopDaemonStatus> {
+    match send_unary_daemon_request(ClientRequest::GetStatus).await? {
+        DaemonResponse::Status(status) => Ok(to_desktop_status(status)),
+        DaemonResponse::Error { code, message } => {
+            Err(anyhow::anyhow!("daemon error {code}: {message}"))
+        }
+        other => Err(anyhow::anyhow!("unexpected daemon response: {other:?}")),
+    }
+}
+
+async fn send_unary_daemon_request(request_payload: ClientRequest) -> Result<DaemonResponse> {
     let stream = UnixStream::connect(DAEMON_SOCKET_PATH)
         .await
         .with_context(|| format!("failed to connect to daemon socket at {DAEMON_SOCKET_PATH}"))?;
@@ -317,7 +406,7 @@ async fn get_daemon_status() -> Result<DesktopDaemonStatus> {
     let mut lines = BufReader::new(reader).lines();
 
     let request_id = Uuid::new_v4();
-    let request = RpcEnvelope::new(request_id, ClientRequest::GetStatus);
+    let request = RpcEnvelope::new(request_id, request_payload);
 
     let payload = serde_json::to_string(&request).context("failed to serialize daemon request")?;
     writer
@@ -340,13 +429,7 @@ async fn get_daemon_status() -> Result<DesktopDaemonStatus> {
 
     validate_response_metadata(request_id, &response)?;
 
-    match response.payload {
-        DaemonResponse::Status(status) => Ok(to_desktop_status(status)),
-        DaemonResponse::Error { code, message } => {
-            Err(anyhow::anyhow!("daemon error {code}: {message}"))
-        }
-        other => Err(anyhow::anyhow!("unexpected daemon response: {other:?}")),
-    }
+    Ok(response.payload)
 }
 
 fn to_desktop_status(status: openausweis_ipc::DaemonStatus) -> DesktopDaemonStatus {
@@ -393,8 +476,26 @@ fn spawn_daemon_status_stream(app: AppHandle) {
     });
 }
 
+fn spawn_daemon_session_stream(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            if let Err(err) = stream_daemon_sessions_once(&app).await {
+                let _ = app.emit(
+                    DAEMON_SESSION_EVENT,
+                    disconnected_session_update(format!("daemon session stream error: {err}")),
+                );
+                sleep(reconnect_session_backoff_delay()).await;
+            }
+        }
+    });
+}
+
 fn reconnect_backoff_delay() -> Duration {
     Duration::from_millis(DAEMON_STATUS_RECONNECT_DELAY_MS)
+}
+
+fn reconnect_session_backoff_delay() -> Duration {
+    Duration::from_millis(DAEMON_SESSION_RECONNECT_DELAY_MS)
 }
 
 async fn stream_daemon_status_once(app: &AppHandle) -> Result<()> {
@@ -436,6 +537,45 @@ async fn stream_daemon_status_once(app: &AppHandle) -> Result<()> {
     Err(anyhow::anyhow!("daemon stream closed connection"))
 }
 
+async fn stream_daemon_sessions_once(app: &AppHandle) -> Result<()> {
+    let stream = UnixStream::connect(DAEMON_SOCKET_PATH)
+        .await
+        .with_context(|| format!("failed to connect to daemon socket at {DAEMON_SOCKET_PATH}"))?;
+
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+
+    let request_id = Uuid::new_v4();
+    let request = RpcEnvelope::new(
+        request_id,
+        ClientRequest::WatchSessions {
+            interval_ms: DAEMON_SESSION_STREAM_INTERVAL_MS,
+        },
+    );
+
+    let payload = serde_json::to_string(&request).context("failed to serialize daemon request")?;
+    writer
+        .write_all(payload.as_bytes())
+        .await
+        .context("failed to write daemon request")?;
+    writer
+        .write_all(b"\n")
+        .await
+        .context("failed to write daemon request newline")?;
+
+    while let Some(line) = lines
+        .next_line()
+        .await
+        .context("failed to read daemon session stream response")?
+    {
+        let update = parse_session_stream_response_line(request_id, &line)?;
+        app.emit(DAEMON_SESSION_EVENT, update)
+            .context("failed to emit daemon session event")?;
+    }
+
+    Err(anyhow::anyhow!("daemon session stream closed connection"))
+}
+
 fn parse_stream_response_line(
     expected_request_id: Uuid,
     line: &str,
@@ -453,6 +593,61 @@ fn parse_stream_response_line(
         other => Err(anyhow::anyhow!(
             "unexpected daemon stream response: {other:?}"
         )),
+    }
+}
+
+fn parse_session_stream_response_line(
+    expected_request_id: Uuid,
+    line: &str,
+) -> Result<DesktopSessionUpdate> {
+    let response: RpcEnvelope<DaemonResponse> =
+        serde_json::from_str(line).context("failed to parse daemon session stream response")?;
+
+    validate_response_metadata(expected_request_id, &response)?;
+
+    match response.payload {
+        DaemonResponse::SessionUpdated {
+            session_id,
+            state,
+            error,
+        } => Ok(DesktopSessionUpdate {
+            connected: true,
+            session_id: Some(session_id.to_string()),
+            state: Some(session_state_wire_value(state).to_string()),
+            error,
+        }),
+        DaemonResponse::SessionCancelled { .. } => Ok(DesktopSessionUpdate {
+            connected: true,
+            session_id: None,
+            state: Some("IDLE".to_string()),
+            error: None,
+        }),
+        DaemonResponse::Error { code, message } => {
+            Err(anyhow::anyhow!("daemon session stream error {code}: {message}"))
+        }
+        other => Err(anyhow::anyhow!(
+            "unexpected daemon session stream response: {other:?}"
+        )),
+    }
+}
+
+fn session_state_wire_value(state: SessionState) -> &'static str {
+    match state {
+        SessionState::Idle => "IDLE",
+        SessionState::Active => "ACTIVE",
+        SessionState::PinEntry => "PIN_ENTRY",
+        SessionState::CardInteraction => "CARD_INTERACTION",
+        SessionState::Completed => "COMPLETED",
+        SessionState::Error => "ERROR",
+    }
+}
+
+fn disconnected_session_update(details: String) -> DesktopSessionUpdate {
+    DesktopSessionUpdate {
+        connected: false,
+        session_id: None,
+        state: Some("IDLE".to_string()),
+        error: Some(details),
     }
 }
 
@@ -502,10 +697,14 @@ fn main() {
         .setup(|app| {
             setup_tray(app)?;
             spawn_daemon_status_stream(app.handle().clone());
+            spawn_daemon_session_stream(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             probe_daemon_status,
+            start_test_session,
+            submit_session_pin,
+            cancel_session,
             get_origin_policy,
             save_origin_policy
         ])

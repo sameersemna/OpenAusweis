@@ -16,6 +16,13 @@ type OriginPolicy = {
   allowedSuffixes: string[];
 };
 
+type SessionUpdate = {
+  connected: boolean;
+  sessionId?: string | null;
+  state?: string | null;
+  error?: string | null;
+};
+
 export function App() {
   const [status, setStatus] = useState("Disconnected");
   const [details, setDetails] = useState("No probe executed yet");
@@ -27,14 +34,38 @@ export function App() {
   const [exactOriginsInput, setExactOriginsInput] = useState("");
   const [suffixesInput, setSuffixesInput] = useState("");
   const [policyState, setPolicyState] = useState("Policy not loaded");
+  const [sessionUpdate, setSessionUpdate] = useState<SessionUpdate>({
+    connected: false,
+    state: "IDLE",
+  });
+  const [pinInput, setPinInput] = useState("");
+  const [pinError, setPinError] = useState<string | null>(null);
+  const [submitPinBusy, setSubmitPinBusy] = useState(false);
+  const [sessionResultMessage, setSessionResultMessage] = useState<string | null>(null);
+  const [sessionCompletedAt, setSessionCompletedAt] = useState<string | null>(null);
 
   useEffect(() => {
     void loadPolicy();
   }, []);
 
   useEffect(() => {
+    if (sessionUpdate.state === "COMPLETED") {
+      setSessionResultMessage("Authentication placeholder completed successfully.");
+      setSessionCompletedAt(new Date().toLocaleTimeString());
+    }
+
+    if (sessionUpdate.state === "ERROR") {
+      setSessionResultMessage(
+        sessionUpdate.error ? `Authentication failed: ${sessionUpdate.error}` : "Authentication failed."
+      );
+      setSessionCompletedAt(new Date().toLocaleTimeString());
+    }
+  }, [sessionUpdate.state, sessionUpdate.sessionId, sessionUpdate.error]);
+
+  useEffect(() => {
     void handleProbeDaemon();
     let unlisten: (() => void) | undefined;
+    let unlistenSession: (() => void) | undefined;
 
     void listen<DaemonStatus>("daemon-status", (event) => {
       applyDaemonStatus(event.payload);
@@ -42,9 +73,24 @@ export function App() {
       unlisten = dispose;
     });
 
+    void listen<SessionUpdate>("daemon-session", (event) => {
+      setSessionUpdate(event.payload);
+
+      // Reset stale PIN input/errors as session state evolves.
+      if (event.payload.state !== "PIN_ENTRY") {
+        setPinInput("");
+        setPinError(null);
+      }
+    }).then((dispose) => {
+      unlistenSession = dispose;
+    });
+
     return () => {
       if (unlisten) {
         unlisten();
+      }
+      if (unlistenSession) {
+        unlistenSession();
       }
     };
   }, []);
@@ -124,6 +170,60 @@ export function App() {
     }
   }
 
+  async function handleCancelActiveSession() {
+    if (!sessionUpdate.sessionId) {
+      return;
+    }
+
+    try {
+      await invoke("cancel_session", { sessionId: sessionUpdate.sessionId });
+      setSessionResultMessage("Session cancelled.");
+    } catch (error) {
+      setSessionUpdate((previous) => ({
+        ...previous,
+        error: `Cancel failed: ${String(error)}`,
+      }));
+    }
+  }
+
+  async function handleStartTestSession() {
+    try {
+      const update = await invoke<SessionUpdate>("start_test_session");
+      setSessionUpdate(update);
+      setPinError(null);
+      setSessionResultMessage(null);
+      setSessionCompletedAt(null);
+    } catch (error) {
+      setSessionUpdate((previous) => ({
+        ...previous,
+        error: `Start session failed: ${String(error)}`,
+      }));
+    }
+  }
+
+  async function handleSubmitPin() {
+    if (!sessionUpdate.sessionId) {
+      return;
+    }
+
+    setSubmitPinBusy(true);
+    setPinError(null);
+    try {
+      const update = await invoke<SessionUpdate>("submit_session_pin", {
+        sessionId: sessionUpdate.sessionId,
+        pin: pinInput,
+      });
+      setSessionUpdate(update);
+      setPinInput("");
+    } catch (error) {
+      setPinError(String(error));
+    } finally {
+      setSubmitPinBusy(false);
+    }
+  }
+
+  const showPinModal = sessionUpdate.sessionId && sessionUpdate.state === "PIN_ENTRY";
+
   return (
     <main className="app-shell">
       <section className="card">
@@ -140,6 +240,40 @@ export function App() {
           <button onClick={handleProbeDaemon}>Probe daemon</button>
           <button className="secondary" onClick={loadPolicy}>Reload policy</button>
         </div>
+
+        <section className="session-panel">
+          <h2>Authentication Session</h2>
+          <div className="status-row session-row">
+            <span className="label">Stream</span>
+            <span className={sessionUpdate.connected ? "value good" : "value bad"}>
+              {sessionUpdate.connected ? "Connected" : "Disconnected"}
+            </span>
+          </div>
+          <p className="subtitle">
+            State: {sessionUpdate.state ?? "IDLE"}
+            {sessionUpdate.sessionId ? ` | Session: ${sessionUpdate.sessionId}` : ""}
+          </p>
+          {sessionUpdate.sessionId ? (
+            <div className="actions">
+              <button className="secondary" onClick={handleCancelActiveSession}>
+                Cancel session
+              </button>
+            </div>
+          ) : (
+            <div className="actions">
+              <button className="secondary" onClick={handleStartTestSession}>
+                Start test session
+              </button>
+            </div>
+          )}
+          {sessionUpdate.error ? <p className="reader-error">{sessionUpdate.error}</p> : null}
+          {sessionResultMessage ? (
+            <p className="session-result">
+              {sessionResultMessage}
+              {sessionCompletedAt ? ` (${sessionCompletedAt})` : ""}
+            </p>
+          ) : null}
+        </section>
 
         <section className="device-panel">
           <h2>Reader and Card Status</h2>
@@ -237,6 +371,36 @@ export function App() {
           <p className="subtitle">{policyState}</p>
         </section>
       </section>
+
+      {showPinModal ? (
+        <div className="modal-backdrop" role="presentation">
+          <section className="pin-modal" role="dialog" aria-modal="true" aria-label="Enter eID PIN">
+            <h2>Enter eID PIN</h2>
+            <p className="subtitle">Session {sessionUpdate.sessionId}</p>
+            <label className="field-label" htmlFor="pin-input">PIN (6 digits)</label>
+            <input
+              id="pin-input"
+              className="pin-input"
+              type="password"
+              value={pinInput}
+              inputMode="numeric"
+              maxLength={6}
+              autoFocus
+              onChange={(event) => setPinInput(event.target.value.replace(/\D+/g, ""))}
+              placeholder="******"
+            />
+            {pinError ? <p className="reader-error">{pinError}</p> : null}
+            <div className="actions">
+              <button onClick={handleSubmitPin} disabled={submitPinBusy || pinInput.length !== 6}>
+                {submitPinBusy ? "Submitting..." : "Submit PIN"}
+              </button>
+              <button className="secondary" onClick={handleCancelActiveSession} disabled={submitPinBusy}>
+                Cancel
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
     </main>
   );
 }

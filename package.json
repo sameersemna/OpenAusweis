@@ -11,6 +11,7 @@
   "scripts": {
     "build": "npm run --workspaces --if-present build",
     "dev": "npm run --workspace @openausweis/desktop dev",
+    "dev:aa2": "./scripts/run-desktop-ausweisapp2.sh",
     "lint": "npm run --workspaces --if-present lint",
     "typecheck": "npm run --workspaces --if-present typecheck"
   }

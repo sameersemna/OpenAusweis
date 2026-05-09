@@ -87,6 +87,36 @@ h1 {
   border-top: 1px solid var(--border);
 }
 
+.session-panel {
+  margin-top: 1.4rem;
+  padding-top: 1.2rem;
+  border-top: 1px solid var(--border);
+}
+
+.session-panel h2 {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.session-row {
+  margin-top: 0.8rem;
+}
+
+.value.good {
+  color: #1f6f2f;
+}
+
+.value.bad {
+  color: #8b2f2f;
+}
+
+.session-result {
+  margin-top: 0.7rem;
+  color: #1f6f2f;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
 .device-panel h2,
 .device-panel h3 {
   margin: 0;
@@ -240,6 +270,51 @@ button:hover {
 button.secondary {
   background: var(--secondary);
   color: var(--text);
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(8, 21, 33, 0.45);
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  z-index: 20;
+}
+
+.pin-modal {
+  width: min(25rem, 100%);
+  background: #ffffff;
+  border: 1px solid var(--border);
+  border-radius: 0.9rem;
+  padding: 1rem 1.1rem;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.2);
+}
+
+.pin-modal h2 {
+  margin: 0;
+  font-size: 1.1rem;
+}
+
+.pin-input {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 0.65rem;
+  padding: 0.55rem 0.7rem;
+  font: inherit;
+  font-size: 1rem;
+  letter-spacing: 0.3rem;
+  background: #fcfefe;
+}
+
+.pin-input:focus {
+  outline: 2px solid #9ccad8;
+  outline-offset: 1px;
 }
 
 @media (max-width: 640px) {

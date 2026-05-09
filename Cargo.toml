@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "apps/daemon",
+  "apps/ausweisapp2-bridge",
   "apps/native-host",
   "apps/desktop/src-tauri",
   "crates/openausweis-ipc",
@@ -21,10 +22,12 @@ async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "io-util", "io-std", "fs"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "io-util", "io-std", "fs", "process"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 sha2 = "0.10"
 pcsc = "2"
 url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
+futures-util = "0.3"
+tokio-tungstenite = "0.28"

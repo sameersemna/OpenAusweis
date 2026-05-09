@@ -85,6 +85,17 @@ function buildPayload(message) {
   switch (message.type) {
     case "GET_STATUS":
       return { type: "GET_STATUS" };
+    case "WATCH_SESSIONS": {
+      const intervalMs = Number(message.interval_ms);
+      if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
+        throw new Error("WATCH_SESSIONS requires positive interval_ms");
+      }
+
+      return {
+        type: "WATCH_SESSIONS",
+        data: { interval_ms: Math.floor(intervalMs) },
+      };
+    }
     case "START_SESSION": {
       const relyingParty = message.relying_party;
       if (typeof relyingParty !== "string" || relyingParty.length === 0) {
@@ -94,6 +105,21 @@ function buildPayload(message) {
       return {
         type: "START_SESSION",
         data: { relying_party: relyingParty },
+      };
+    }
+    case "SUBMIT_PIN": {
+      const sessionId = message.session_id;
+      const pin = message.pin;
+      if (typeof sessionId !== "string" || sessionId.length === 0) {
+        throw new Error("SUBMIT_PIN requires session_id");
+      }
+      if (typeof pin !== "string" || pin.length === 0) {
+        throw new Error("SUBMIT_PIN requires pin");
+      }
+
+      return {
+        type: "SUBMIT_PIN",
+        data: { session_id: sessionId, pin },
       };
     }
     case "CANCEL_SESSION": {
@@ -188,12 +214,83 @@ async function sendNative(requestEnvelope) {
   });
 }
 
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForSessionCompletion(sessionId, timeoutMs = 120000) {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    try {
+      const payload = await sendNative(
+        buildRequestEnvelope({ type: "WATCH_SESSIONS", interval_ms: 500 })
+      );
+
+      if (payload?.type === "SESSION_UPDATED") {
+        const updateSessionId = payload?.data?.session_id;
+        if (updateSessionId !== sessionId) {
+          continue;
+        }
+
+        const state = payload?.data?.state;
+        if (state === "COMPLETED") {
+          return payload;
+        }
+
+        if (state === "ERROR") {
+          const message = payload?.data?.error ?? "Session failed";
+          throw new Error(String(message));
+        }
+      }
+
+      if (payload?.type === "SESSION_CANCELLED") {
+        if (payload?.data?.session_id === sessionId) {
+          return payload;
+        }
+      }
+    } catch (error) {
+      const message = String(error);
+      if (
+        message.includes("timed out") ||
+        message.includes("session stream event") ||
+        message.includes("Native host timed out")
+      ) {
+        await wait(200);
+        continue;
+      }
+
+      throw error;
+    }
+
+    await wait(120);
+  }
+
+  throw new Error("Session timed out while waiting for completion");
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
     await validateStartSessionOrigin(message, sender);
 
     const requestEnvelope = buildRequestEnvelope(message);
     const response = await sendNative(requestEnvelope);
+
+    if (message?.type === "START_SESSION" && response?.type === "SESSION_STARTED") {
+      const sessionId = response?.data?.session_id;
+      if (typeof sessionId !== "string" || sessionId.length === 0) {
+        throw new Error("SESSION_STARTED did not provide a session_id");
+      }
+
+      const completionResponse = await waitForSessionCompletion(sessionId);
+      sendResponse({
+        ok: true,
+        response: completionResponse,
+        sessionStarted: response,
+      });
+      return;
+    }
+
     sendResponse({ ok: true, response });
   })().catch((error) => sendResponse({ ok: false, error: String(error) }));
 
