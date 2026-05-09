@@ -1,0 +1,54 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-lock.yaml
+
+# Rust
+target/
+Cargo.lock
+
+# Tauri
+src-tauri/target/
+
+# Logs
+logs/
+*.log
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build
+dist/
+build/
+out/
+
+# Coverage
+coverage/
+
+# Temporary
+tmp/
+temp/
+
+# Snap / Flatpak
+.snapcraft/
+.flatpak-builder/
+
+# Generated
+generated/
+
+# Secrets
+*.pem
+*.key
+*.crt
