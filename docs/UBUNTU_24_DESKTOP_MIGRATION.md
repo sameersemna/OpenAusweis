@@ -63,7 +63,7 @@ Run the desktop app on Ubuntu 24.04 without local linker hacks, local pkg-config
 - [x] Tray setup migrated from v1 to v2 APIs.
 - [x] Desktop commands compile and execute under v2 runtime.
 - [x] Ubuntu 24.04 local `tauri dev` runs without libsoup symbol conflicts.
-- [ ] CI updated for desktop runtime coverage.
+- [x] CI updated for desktop runtime coverage.
 
 ## Runtime Note (VS Code Snap)
 
@@ -78,3 +78,13 @@ Use:
 - Tray API migration is the highest code-change risk area.
 - Desktop build tooling changes may affect command names and config shape.
 - This migration should be isolated from unrelated feature work to reduce regression risk.
+
+## Migration Complete
+
+All phases completed as of 2026-05-09.
+
+- Tauri v2 runtime on Ubuntu 24.04 validated locally (daemon probe, policy save/load, tray Quit).
+- CI lane added: `.github/workflows/ci.yml` `desktop` job runs `cargo fmt`, `cargo clippy`, `cargo check`, and `npm run typecheck` on `ubuntu-24.04` with WebKitGTK 4.1 system deps.
+- VS Code Snap workaround documented and shipped as `tauri:dev:snap-safe` npm script.
+
+This document is retained for historical context. No further migration work is required unless the Tauri major version changes again.

@@ -6,11 +6,20 @@
 - Node.js 22+
 - npm 10+
 - pcsc-lite runtime and headers for future smartcard integration
-- For Tauri desktop compilation on Ubuntu:
+- For Tauri desktop compilation on Ubuntu 24.04+:
 
 ```bash
-sudo apt install -y libwebkit2gtk-4.0-dev libgtk-3-dev libayatana-appindicator3-dev libsoup2.4-dev
+sudo apt install -y \
+  libwebkit2gtk-4.1-dev \
+  libgtk-3-dev \
+  libayatana-appindicator3-dev \
+  librsvg2-dev \
+  libssl-dev \
+  pkg-config
 ```
+
+> **VS Code Snap users:** run the desktop via `npm run --workspace @openausweis/desktop tauri:dev:snap-safe`
+> to strip Snap-injected GTK/GIO environment variables that cause runtime symbol errors.
 
 ## Install
 
