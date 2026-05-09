@@ -5,7 +5,18 @@
 - Rust stable toolchain
 - Node.js 22+
 - npm 10+
-- pcsc-lite runtime and headers for future smartcard integration
+- PC/SC runtime + headers for smartcard integration:
+
+```bash
+sudo apt install -y pcscd libpcsclite1 libpcsclite-dev pkgconf pcsc-tools
+sudo systemctl enable --now pcscd
+```
+
+- Quick smartcard diagnostics:
+
+```bash
+pcsc_scan
+```
 - For Tauri desktop compilation on Ubuntu 24.04+:
 
 ```bash
@@ -69,3 +80,31 @@ OPENAUSWEIS_ALLOWED_SUFFIXES=".bundid.de,.bund.de" \
 - Override policy bundle root with `OPENAUSWEIS_POLICY_DIR` for desktop and native-host.
 - `OPENAUSWEIS_POLICY_FILE` is still accepted as a legacy compatibility path for reads.
 - eID cryptographic operations are intentionally delegated to official components in future milestones.
+- Daemon status probe now includes reader list, card presence, and diagnostics for PC/SC failures.
+- Desktop app now receives daemon status updates over a long-lived watch stream (`WATCH_STATUS`) and renders updates in near real time.
+- Watch stream publishes change-only status snapshots (initial snapshot + subsequent deltas) to reduce redundant traffic.
+
+## Smartcard Status Manual Validation
+
+1. Ensure PC/SC runtime is active:
+
+```bash
+systemctl status pcscd --no-pager
+```
+
+2. Start OpenAusweis desktop + daemon and keep the desktop status panel visible.
+3. With no reader attached, verify UI shows no readers and a healthy/disconnected daemon state consistent with runtime.
+4. Attach a supported PC/SC reader and verify the reader appears in UI without restarting desktop.
+5. Insert eID card and verify the corresponding reader status flips to `Card present`.
+6. Remove eID card and verify status returns to `No card`.
+7. Stop PC/SC service and verify diagnostics surface a stream or probe error:
+
+```bash
+sudo systemctl stop pcscd
+```
+
+8. Restart PC/SC service and verify stream recovers and reader/card status resumes:
+
+```bash
+sudo systemctl start pcscd
+```

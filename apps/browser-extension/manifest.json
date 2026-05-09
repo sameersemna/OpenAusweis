@@ -17,6 +17,7 @@
     }
   ],
   "action": {
-    "default_title": "OpenAusweis"
+    "default_title": "OpenAusweis",
+    "default_popup": "src/popup.html"
   }
 }

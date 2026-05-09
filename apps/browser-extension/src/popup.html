@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OpenAusweis</title>
+    <style>
+      :root {
+        --bg: #f4f8fb;
+        --surface: #ffffff;
+        --text: #182230;
+        --muted: #5b6774;
+        --border: #bed0da;
+        --primary: #0f6e83;
+        --green: #1f6f2f;
+        --green-bg: #e8f7e8;
+        --green-border: #9ed5a5;
+        --amber: #806124;
+        --amber-bg: #f5f1e7;
+        --amber-border: #e2cf98;
+        --red: #8b2f2f;
+        --red-bg: #fdf0f0;
+        --red-border: #e8b3b3;
+      }
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      body {
+        width: 280px;
+        font-family: "Segoe UI", system-ui, sans-serif;
+        font-size: 13px;
+        color: var(--text);
+        background: var(--bg);
+      }
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 10px 12px 8px;
+        border-bottom: 1px solid var(--border);
+        background: var(--surface);
+      }
+      header h1 {
+        font-size: 14px;
+        font-weight: 700;
+      }
+      #refresh-btn {
+        background: none;
+        border: none;
+        cursor: pointer;
+        color: var(--primary);
+        font-size: 15px;
+        padding: 2px 4px;
+        border-radius: 4px;
+        line-height: 1;
+      }
+      #refresh-btn:hover { background: #e3edf2; }
+      .body { padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+      .row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 7px 10px;
+        border: 1px solid var(--border);
+        border-radius: 7px;
+        background: var(--surface);
+      }
+      .row-label { color: var(--muted); font-size: 12px; }
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 2px 8px;
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 600;
+        border: 1px solid transparent;
+      }
+      .badge::before { content: ""; width: 6px; height: 6px; border-radius: 50%; }
+      .badge.ok {
+        background: var(--green-bg);
+        color: var(--green);
+        border-color: var(--green-border);
+      }
+      .badge.ok::before { background: var(--green); }
+      .badge.warn {
+        background: var(--amber-bg);
+        color: var(--amber);
+        border-color: var(--amber-border);
+      }
+      .badge.warn::before { background: var(--amber); }
+      .badge.err {
+        background: var(--red-bg);
+        color: var(--red);
+        border-color: var(--red-border);
+      }
+      .badge.err::before { background: var(--red); }
+      .readers-section { display: flex; flex-direction: column; gap: 6px; }
+      .readers-section .label {
+        font-size: 11px;
+        font-weight: 600;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        padding: 0 1px;
+      }
+      .reader-item {
+        padding: 7px 10px;
+        border: 1px solid var(--border);
+        border-radius: 7px;
+        background: var(--surface);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 6px;
+      }
+      .reader-name {
+        font-weight: 600;
+        font-size: 12px;
+        flex: 1;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .error-note {
+        padding: 8px 10px;
+        border: 1px solid var(--red-border);
+        border-radius: 7px;
+        background: var(--red-bg);
+        color: var(--red);
+        font-size: 12px;
+        line-height: 1.4;
+      }
+      .hint-note {
+        padding: 8px 10px;
+        border: 1px solid var(--border);
+        border-radius: 7px;
+        background: var(--surface);
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.4;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>OpenAusweis</h1>
+      <button id="refresh-btn" title="Refresh status">&#8635;</button>
+    </header>
+    <div class="body" id="body">
+      <div class="hint-note">Loading…</div>
+    </div>
+    <script src="popup.js"></script>
+  </body>
+</html>

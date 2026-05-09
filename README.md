@@ -84,9 +84,24 @@ Implemented in this baseline:
 - GitHub Actions CI workflows
 - Local development scripts and workflow doc
 
+Implemented for Phase 2 (in progress):
+
+- PC/SC context probing in daemon using `pcsc-lite`
+- Reader enumeration and card presence snapshot in daemon status responses
+- Desktop UI reader/card status panel with daemon watch stream updates
+- Daemon watch stream suppresses unchanged status frames to reduce IPC noise
+- Diagnostic messages surfaced in UI for reader/card detection failures
+
 Desktop run note (VS Code Snap on Linux):
 
 - Use `npm run --workspace @openausweis/desktop tauri:dev:snap-safe` to avoid Snap-injected GTK/GIO runtime path conflicts.
+
+Smartcard runtime requirements (Ubuntu 24.04+):
+
+```bash
+sudo apt install -y pcscd libpcsclite1 libpcsclite-dev pkgconf pcsc-tools
+sudo systemctl enable --now pcscd
+```
 
 ---
 

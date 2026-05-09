@@ -13,6 +13,9 @@ function setupLoginBridge() {
       relying_party: window.location.origin,
     });
 
+    // Dispatch a CustomEvent so demo pages (and relying parties) can observe the outcome.
+    window.dispatchEvent(new CustomEvent("openausweis:response", { detail: response }));
+
     if (!response?.ok) {
       console.warn("OpenAusweis bridge error", response?.error);
       return;

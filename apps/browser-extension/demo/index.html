@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OpenAusweis – Demo Relying Party</title>
+    <style>
+      :root {
+        --bg: #f4f8fb;
+        --surface: #fff;
+        --text: #182230;
+        --muted: #5b6774;
+        --border: #bed0da;
+        --primary: #0f6e83;
+        --primary-hover: #0c5c6d;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: "Segoe UI", system-ui, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 2rem;
+      }
+      .card {
+        width: min(28rem, 100%);
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 1rem;
+        padding: 2rem;
+        box-shadow: 0 12px 32px rgba(17, 42, 58, 0.1);
+      }
+      h1 { margin: 0 0 0.25rem; font-size: 1.5rem; }
+      .subtitle { color: var(--muted); margin-bottom: 1.5rem; font-size: 0.95rem; }
+      .divider { border: none; border-top: 1px solid var(--border); margin: 1.5rem 0; }
+      .login-btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+        border: none;
+        border-radius: 0.65rem;
+        padding: 0.75rem 1.2rem;
+        background: var(--primary);
+        color: #fff;
+        font: inherit;
+        font-size: 1rem;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      .login-btn:hover { background: var(--primary-hover); }
+      .login-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+      #status-box {
+        margin-top: 1rem;
+        padding: 0.75rem 1rem;
+        border-radius: 0.65rem;
+        font-size: 0.9rem;
+        border: 1px solid var(--border);
+        background: #f9fbfc;
+        color: var(--muted);
+        min-height: 2.5rem;
+        display: none;
+      }
+      #status-box.visible { display: block; }
+      #status-box.ok { border-color: #9ed5a5; background: #e8f7e8; color: #1f6f2f; }
+      #status-box.error { border-color: #e8b3b3; background: #fdf0f0; color: #8b2f2f; }
+      .note {
+        margin-top: 1.25rem;
+        font-size: 0.82rem;
+        color: var(--muted);
+        line-height: 1.5;
+      }
+      code {
+        background: #e3edf2;
+        border-radius: 0.3rem;
+        padding: 0.05rem 0.35rem;
+        font-size: 0.8rem;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>Demo Relying Party</h1>
+      <p class="subtitle">
+        OpenAusweis browser integration test page.<br />
+        Simulates a website that triggers eID authentication.
+      </p>
+
+      <hr class="divider" />
+
+      <button class="login-btn" data-openausweis-login>
+        &#128273; Mit eID anmelden
+      </button>
+
+      <div id="status-box"></div>
+
+      <p class="note">
+        <strong>Prerequisites:</strong> Load the browser extension as unpacked in
+        <code>chrome://extensions</code>, install the native messaging host via
+        <code>scripts/install-native-host.sh &lt;EXTENSION_ID&gt;</code>, and
+        start the daemon with <code>cargo run -p openausweis-daemon</code>.
+      </p>
+    </div>
+
+    <script>
+      // Intercept the response from content.js and display feedback.
+      // The actual bridge call is made by content.js injected by the extension.
+      // We use a CustomEvent to let content.js signal back to the page.
+      window.addEventListener("openausweis:response", (event) => {
+        const box = document.getElementById("status-box");
+        const detail = /** @type {any} */ (event).detail;
+        box.classList.add("visible");
+        if (detail?.ok) {
+          box.className = "visible ok";
+          box.textContent = "Bridge responded OK. Response type: " +
+            (detail.response?.type ?? "(unknown)");
+        } else {
+          box.className = "visible error";
+          box.textContent = "Bridge error: " + String(detail?.error ?? "unknown");
+        }
+      });
+    </script>
+  </body>
+</html>

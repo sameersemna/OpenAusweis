@@ -29,6 +29,7 @@ impl<T> RpcEnvelope<T> {
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ClientRequest {
     GetStatus,
+    WatchStatus { interval_ms: u64 },
     StartSession { relying_party: String },
     CancelSession { session_id: Uuid },
 }
@@ -42,9 +43,19 @@ pub enum DaemonResponse {
     Error { code: String, message: String },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonStatus {
     pub healthy: bool,
     pub pcsc_available: bool,
     pub active_session_count: u32,
+    pub readers: Vec<ReaderStatus>,
+    pub diagnostics: Vec<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReaderStatus {
+    pub name: String,
+    pub card_present: bool,
+    pub error: Option<String>,
 }

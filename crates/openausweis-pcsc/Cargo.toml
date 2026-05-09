@@ -7,4 +7,5 @@ license.workspace = true
 [dependencies]
 openausweis-core = { path = "../openausweis-core" }
 async-trait.workspace = true
+pcsc.workspace = true
 tracing.workspace = true

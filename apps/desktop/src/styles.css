@@ -81,6 +81,118 @@ h1 {
   border-top: 1px solid var(--border);
 }
 
+.device-panel {
+  margin-top: 1.4rem;
+  padding-top: 1.2rem;
+  border-top: 1px solid var(--border);
+}
+
+.device-panel h2,
+.device-panel h3 {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.device-panel h3 {
+  margin-top: 0.85rem;
+  font-size: 0.95rem;
+  color: var(--muted);
+}
+
+.diagnostics-actions {
+  margin-top: 0.8rem;
+}
+
+.subtle-note {
+  margin-top: 0.45rem;
+  font-size: 0.82rem;
+}
+
+.device-list,
+.diagnostics-list {
+  margin: 0.7rem 0 0;
+  padding-left: 1.1rem;
+}
+
+.device-list li,
+.diagnostics-list li {
+  margin-bottom: 0.45rem;
+}
+
+.reader-name {
+  margin-right: 0.5rem;
+  font-weight: 600;
+}
+
+.badge {
+  display: inline-block;
+  border-radius: 999px;
+  padding: 0.1rem 0.55rem;
+  font-size: 0.78rem;
+  border: 1px solid transparent;
+}
+
+.badge.present {
+  background: #e8f7e8;
+  color: #1f6f2f;
+  border-color: #9ed5a5;
+}
+
+.badge.absent {
+  background: #f5f1e7;
+  color: #806124;
+  border-color: #e2cf98;
+}
+
+.reader-error {
+  margin: 0.35rem 0 0;
+  color: #8b2f2f;
+  font-size: 0.86rem;
+}
+
+.hotplug-guide {
+  margin-top: 1rem;
+  border: 1px solid #d9e6ed;
+  border-radius: 0.65rem;
+  background: #f4f9fb;
+  padding: 0.75rem 0.9rem;
+}
+
+.hotplug-toggle {
+  background: none;
+  color: var(--primary);
+  padding: 0;
+  border-radius: 0;
+  font-size: 0.88rem;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+}
+
+.hotplug-toggle:hover {
+  background: none;
+  text-decoration: underline;
+}
+
+.hotplug-checklist {
+  margin: 0.7rem 0 0;
+  padding-left: 1.2rem;
+}
+
+.hotplug-step {
+  margin-bottom: 0.6rem;
+  font-size: 0.88rem;
+  line-height: 1.5;
+  color: var(--text);
+}
+
+.hotplug-step code {
+  background: #e3edf2;
+  border-radius: 0.3rem;
+  padding: 0.05rem 0.35rem;
+  font-size: 0.83rem;
+}
+
 .policy-panel h2 {
   margin: 0;
   font-size: 1.05rem;

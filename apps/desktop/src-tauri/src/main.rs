@@ -8,22 +8,38 @@ use sha2::{Digest, Sha256};
 use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::path::PathBuf;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
+use tauri::{AppHandle, Emitter};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
+use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
 const DAEMON_SOCKET_PATH: &str = "/tmp/openausweis-daemon.sock";
+const DAEMON_STATUS_EVENT: &str = "daemon-status";
+const DAEMON_STATUS_STREAM_INTERVAL_MS: u64 = 1000;
+const DAEMON_STATUS_RECONNECT_DELAY_MS: u64 = 1500;
 const DEFAULT_ALLOWED_EXACT_ORIGINS: &[&str] = &["http://localhost", "https://localhost"];
 const DEFAULT_ALLOWED_SUFFIXES: &[&str] = &[".bundid.de", ".bund.de"];
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopDaemonStatus {
     healthy: bool,
     pcsc_available: bool,
     active_session_count: u32,
+    readers: Vec<DesktopReaderStatus>,
+    diagnostics: Vec<String>,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopReaderStatus {
+    name: String,
+    card_present: bool,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -322,6 +338,128 @@ async fn get_daemon_status() -> Result<DesktopDaemonStatus> {
     let response: RpcEnvelope<DaemonResponse> =
         serde_json::from_str(&line).context("failed to parse daemon response")?;
 
+    validate_response_metadata(request_id, &response)?;
+
+    match response.payload {
+        DaemonResponse::Status(status) => Ok(to_desktop_status(status)),
+        DaemonResponse::Error { code, message } => {
+            Err(anyhow::anyhow!("daemon error {code}: {message}"))
+        }
+        other => Err(anyhow::anyhow!("unexpected daemon response: {other:?}")),
+    }
+}
+
+fn to_desktop_status(status: openausweis_ipc::DaemonStatus) -> DesktopDaemonStatus {
+    DesktopDaemonStatus {
+        healthy: status.healthy,
+        pcsc_available: status.pcsc_available,
+        active_session_count: status.active_session_count,
+        readers: status
+            .readers
+            .into_iter()
+            .map(|reader| DesktopReaderStatus {
+                name: reader.name,
+                card_present: reader.card_present,
+                error: reader.error,
+            })
+            .collect(),
+        diagnostics: status.diagnostics,
+        last_error: status.last_error,
+    }
+}
+
+fn disconnected_status(details: String) -> DesktopDaemonStatus {
+    DesktopDaemonStatus {
+        healthy: false,
+        pcsc_available: false,
+        active_session_count: 0,
+        readers: Vec::new(),
+        diagnostics: vec![details],
+        last_error: Some("daemon stream disconnected".to_string()),
+    }
+}
+
+fn spawn_daemon_status_stream(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            if let Err(err) = stream_daemon_status_once(&app).await {
+                let _ = app.emit(
+                    DAEMON_STATUS_EVENT,
+                    disconnected_status(format!("daemon status stream error: {err}")),
+                );
+                sleep(reconnect_backoff_delay()).await;
+            }
+        }
+    });
+}
+
+fn reconnect_backoff_delay() -> Duration {
+    Duration::from_millis(DAEMON_STATUS_RECONNECT_DELAY_MS)
+}
+
+async fn stream_daemon_status_once(app: &AppHandle) -> Result<()> {
+    let stream = UnixStream::connect(DAEMON_SOCKET_PATH)
+        .await
+        .with_context(|| format!("failed to connect to daemon socket at {DAEMON_SOCKET_PATH}"))?;
+
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+
+    let request_id = Uuid::new_v4();
+    let request = RpcEnvelope::new(
+        request_id,
+        ClientRequest::WatchStatus {
+            interval_ms: DAEMON_STATUS_STREAM_INTERVAL_MS,
+        },
+    );
+
+    let payload = serde_json::to_string(&request).context("failed to serialize daemon request")?;
+    writer
+        .write_all(payload.as_bytes())
+        .await
+        .context("failed to write daemon request")?;
+    writer
+        .write_all(b"\n")
+        .await
+        .context("failed to write daemon request newline")?;
+
+    while let Some(line) = lines
+        .next_line()
+        .await
+        .context("failed to read daemon stream response")?
+    {
+        let status = parse_stream_response_line(request_id, &line)?;
+        app.emit(DAEMON_STATUS_EVENT, status)
+            .context("failed to emit daemon status event")?;
+    }
+
+    Err(anyhow::anyhow!("daemon stream closed connection"))
+}
+
+fn parse_stream_response_line(
+    expected_request_id: Uuid,
+    line: &str,
+) -> Result<DesktopDaemonStatus> {
+    let response: RpcEnvelope<DaemonResponse> =
+        serde_json::from_str(line).context("failed to parse daemon stream response")?;
+
+    validate_response_metadata(expected_request_id, &response)?;
+
+    match response.payload {
+        DaemonResponse::Status(status) => Ok(to_desktop_status(status)),
+        DaemonResponse::Error { code, message } => {
+            Err(anyhow::anyhow!("daemon stream error {code}: {message}"))
+        }
+        other => Err(anyhow::anyhow!(
+            "unexpected daemon stream response: {other:?}"
+        )),
+    }
+}
+
+fn validate_response_metadata(
+    expected_request_id: Uuid,
+    response: &RpcEnvelope<DaemonResponse>,
+) -> Result<()> {
     if response.protocol_version != IPC_PROTOCOL_VERSION {
         return Err(anyhow::anyhow!(
             "daemon protocol mismatch: expected {}, got {}",
@@ -330,25 +468,15 @@ async fn get_daemon_status() -> Result<DesktopDaemonStatus> {
         ));
     }
 
-    if response.request_id != request_id {
+    if response.request_id != expected_request_id {
         return Err(anyhow::anyhow!(
             "daemon returned mismatched request id: expected {}, got {}",
-            request_id,
+            expected_request_id,
             response.request_id
         ));
     }
 
-    match response.payload {
-        DaemonResponse::Status(status) => Ok(DesktopDaemonStatus {
-            healthy: status.healthy,
-            pcsc_available: status.pcsc_available,
-            active_session_count: status.active_session_count,
-        }),
-        DaemonResponse::Error { code, message } => {
-            Err(anyhow::anyhow!("daemon error {code}: {message}"))
-        }
-        other => Err(anyhow::anyhow!("unexpected daemon response: {other:?}")),
-    }
+    Ok(())
 }
 
 fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
@@ -371,7 +499,11 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
 
 fn main() {
     tauri::Builder::default()
-        .setup(|app| setup_tray(app).map_err(Into::into))
+        .setup(|app| {
+            setup_tray(app)?;
+            spawn_daemon_status_stream(app.handle().clone());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             probe_daemon_status,
             get_origin_policy,
@@ -379,4 +511,114 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri app");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    fn sample_response(request_id: Uuid, protocol_version: u16) -> RpcEnvelope<DaemonResponse> {
+        RpcEnvelope {
+            protocol_version,
+            request_id,
+            payload: DaemonResponse::Error {
+                code: "TEST".to_string(),
+                message: "test".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn validate_response_metadata_accepts_matching_values() {
+        let request_id = Uuid::new_v4();
+        let response = sample_response(request_id, IPC_PROTOCOL_VERSION);
+        assert!(validate_response_metadata(request_id, &response).is_ok());
+    }
+
+    #[test]
+    fn validate_response_metadata_rejects_protocol_mismatch() {
+        let request_id = Uuid::new_v4();
+        let response = sample_response(request_id, IPC_PROTOCOL_VERSION + 1);
+        let error = validate_response_metadata(request_id, &response)
+            .expect_err("expected protocol mismatch error");
+        assert!(error.to_string().contains("protocol mismatch"));
+    }
+
+    #[test]
+    fn validate_response_metadata_rejects_request_id_mismatch() {
+        let expected_request_id = Uuid::new_v4();
+        let response = sample_response(Uuid::new_v4(), IPC_PROTOCOL_VERSION);
+        let error = validate_response_metadata(expected_request_id, &response)
+            .expect_err("expected request id mismatch error");
+        assert!(error.to_string().contains("mismatched request id"));
+    }
+
+    #[test]
+    fn disconnected_status_contains_diagnostic_details() {
+        let status = disconnected_status("stream failed".to_string());
+        assert!(!status.healthy);
+        assert!(!status.pcsc_available);
+        assert_eq!(status.diagnostics, vec!["stream failed".to_string()]);
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("daemon stream disconnected")
+        );
+    }
+
+    #[test]
+    fn reconnect_backoff_delay_is_at_least_one_second() {
+        assert!(reconnect_backoff_delay() >= Duration::from_millis(1000));
+    }
+
+    #[test]
+    fn reconnect_backoff_delay_matches_configured_value() {
+        assert_eq!(
+            reconnect_backoff_delay(),
+            Duration::from_millis(DAEMON_STATUS_RECONNECT_DELAY_MS)
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_stream_response_line_rejects_protocol_mismatch_from_socket_frame() {
+        let request_id = Uuid::new_v4();
+        let envelope = RpcEnvelope {
+            protocol_version: IPC_PROTOCOL_VERSION + 1,
+            request_id,
+            payload: DaemonResponse::Error {
+                code: "TEST".to_string(),
+                message: "protocol mismatch simulation".to_string(),
+            },
+        };
+
+        let (client, mut server) = UnixStream::pair().expect("pair failed");
+        let payload = serde_json::to_string(&envelope).expect("serialize failed");
+        server
+            .write_all(payload.as_bytes())
+            .await
+            .expect("write failed");
+        server.write_all(b"\n").await.expect("write newline failed");
+        drop(server);
+
+        let (reader, _) = client.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        let line = lines
+            .next_line()
+            .await
+            .expect("read line failed")
+            .expect("missing line");
+
+        let error = parse_stream_response_line(request_id, &line)
+            .expect_err("expected protocol mismatch parse failure");
+        assert!(error.to_string().contains("protocol mismatch"));
+    }
+
+    #[test]
+    fn fallback_status_includes_stream_error_context() {
+        let err = anyhow::anyhow!("daemon protocol mismatch: expected 1, got 2");
+        let status = disconnected_status(format!("daemon status stream error: {err}"));
+        assert!(status.diagnostics[0].contains("daemon status stream error"));
+        assert!(status.diagnostics[0].contains("protocol mismatch"));
+    }
 }
