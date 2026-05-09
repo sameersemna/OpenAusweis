@@ -10,11 +10,15 @@ use sha2::{Digest, Sha256};
 use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tokio::process::Command;
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
@@ -25,8 +29,17 @@ const DAEMON_STATUS_STREAM_INTERVAL_MS: u64 = 1000;
 const DAEMON_SESSION_STREAM_INTERVAL_MS: u64 = 500;
 const DAEMON_STATUS_RECONNECT_DELAY_MS: u64 = 1500;
 const DAEMON_SESSION_RECONNECT_DELAY_MS: u64 = 1500;
+const DAEMON_AUTOSTART_RETRY_DELAY_MS: u64 = 500;
+const DAEMON_AUTOSTART_COOLDOWN_MS: u64 = 3000;
 const DEFAULT_ALLOWED_EXACT_ORIGINS: &[&str] = &["http://localhost", "https://localhost"];
 const DEFAULT_ALLOWED_SUFFIXES: &[&str] = &[".bundid.de", ".bund.de"];
+
+#[derive(Debug)]
+struct DaemonStartState {
+    last_attempt: Option<Instant>,
+}
+
+static DAEMON_START_STATE: OnceLock<Mutex<DaemonStartState>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -83,9 +96,21 @@ async fn start_test_session() -> std::result::Result<DesktopSessionUpdate, Strin
             state: Some(session_state_wire_value(state).to_string()),
             error: None,
         }),
-        DaemonResponse::Error { code, message } => Err(format!("daemon error {code}: {message}")),
+        DaemonResponse::Error { code, message } => {
+            Err(format_start_session_error(&code, &message))
+        }
         other => Err(format!("unexpected daemon response: {other:?}")),
     }
+}
+
+fn format_start_session_error(code: &str, message: &str) -> String {
+    if code == "NOT_IMPLEMENTED" {
+        return format!(
+            "daemon error {code}: {message}. Restart and rebuild the daemon from this workspace (for example: scripts/dev-up.sh)."
+        );
+    }
+
+    format!("daemon error {code}: {message}")
 }
 
 #[tauri::command]
@@ -397,10 +422,161 @@ async fn get_daemon_status() -> Result<DesktopDaemonStatus> {
     }
 }
 
-async fn send_unary_daemon_request(request_payload: ClientRequest) -> Result<DaemonResponse> {
-    let stream = UnixStream::connect(DAEMON_SOCKET_PATH)
+async fn connect_to_daemon_with_autostart() -> Result<UnixStream> {
+    match connect_to_daemon_socket().await {
+        Ok(stream) => Ok(stream),
+        Err(initial_error) => {
+            if !is_socket_bootstrap_error(&initial_error) {
+                return Err(initial_error);
+            }
+
+            maybe_autostart_daemon().await?;
+            sleep(Duration::from_millis(DAEMON_AUTOSTART_RETRY_DELAY_MS)).await;
+
+            connect_to_daemon_socket()
+                .await
+                .with_context(|| format!("daemon socket unavailable after autostart attempt; initial error: {initial_error}"))
+        }
+    }
+}
+
+async fn connect_to_daemon_socket() -> Result<UnixStream> {
+    UnixStream::connect(DAEMON_SOCKET_PATH)
         .await
-        .with_context(|| format!("failed to connect to daemon socket at {DAEMON_SOCKET_PATH}"))?;
+        .with_context(|| format!("failed to connect to daemon socket at {DAEMON_SOCKET_PATH}"))
+}
+
+fn is_socket_bootstrap_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .map(|io_err| {
+                matches!(
+                    io_err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
+async fn maybe_autostart_daemon() -> Result<()> {
+    if !record_autostart_attempt() {
+        return Ok(());
+    }
+
+    let mut launch_errors = Vec::new();
+    for launch in daemon_launch_candidates() {
+        let mut command = Command::new(&launch.command);
+        command
+            .args(&launch.args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        if let Some(cwd) = &launch.cwd {
+            command.current_dir(cwd);
+        }
+
+        match command.spawn() {
+            Ok(_) => return Ok(()),
+            Err(err) => {
+                launch_errors.push(format!(
+                    "{} {:?}: {}",
+                    launch.command,
+                    launch.args,
+                    err
+                ));
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "failed to autostart daemon; launch attempts: {}",
+        launch_errors.join(" | ")
+    ))
+}
+
+fn record_autostart_attempt() -> bool {
+    let lock = DAEMON_START_STATE.get_or_init(|| {
+        Mutex::new(DaemonStartState {
+            last_attempt: None,
+        })
+    });
+
+    let mut state = lock.lock().expect("daemon start state lock poisoned");
+    let now = Instant::now();
+
+    if let Some(previous) = state.last_attempt {
+        if now.duration_since(previous) < Duration::from_millis(DAEMON_AUTOSTART_COOLDOWN_MS) {
+            return false;
+        }
+    }
+
+    state.last_attempt = Some(now);
+    true
+}
+
+#[derive(Debug)]
+struct DaemonLaunchCandidate {
+    command: String,
+    args: Vec<String>,
+    cwd: Option<PathBuf>,
+}
+
+fn daemon_launch_candidates() -> Vec<DaemonLaunchCandidate> {
+    let mut candidates = Vec::new();
+
+    if let Ok(command) = std::env::var("OPENAUSWEIS_DAEMON_CMD") {
+        if !command.trim().is_empty() {
+            let args = std::env::var("OPENAUSWEIS_DAEMON_ARGS")
+                .unwrap_or_default()
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+
+            candidates.push(DaemonLaunchCandidate {
+                command,
+                args,
+                cwd: None,
+            });
+        }
+    }
+
+    candidates.push(DaemonLaunchCandidate {
+        command: "openausweis-daemon".to_string(),
+        args: Vec::new(),
+        cwd: None,
+    });
+
+    if cfg!(debug_assertions) {
+        if let Some(workspace_root) = infer_workspace_root() {
+            candidates.push(DaemonLaunchCandidate {
+                command: "cargo".to_string(),
+                args: vec![
+                    "run".to_string(),
+                    "-p".to_string(),
+                    "openausweis-daemon".to_string(),
+                ],
+                cwd: Some(workspace_root),
+            });
+        }
+    }
+
+    candidates
+}
+
+fn infer_workspace_root() -> Option<PathBuf> {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+}
+
+async fn send_unary_daemon_request(request_payload: ClientRequest) -> Result<DaemonResponse> {
+    let stream = connect_to_daemon_with_autostart().await?;
 
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -499,9 +675,7 @@ fn reconnect_session_backoff_delay() -> Duration {
 }
 
 async fn stream_daemon_status_once(app: &AppHandle) -> Result<()> {
-    let stream = UnixStream::connect(DAEMON_SOCKET_PATH)
-        .await
-        .with_context(|| format!("failed to connect to daemon socket at {DAEMON_SOCKET_PATH}"))?;
+    let stream = connect_to_daemon_with_autostart().await?;
 
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -538,9 +712,7 @@ async fn stream_daemon_status_once(app: &AppHandle) -> Result<()> {
 }
 
 async fn stream_daemon_sessions_once(app: &AppHandle) -> Result<()> {
-    let stream = UnixStream::connect(DAEMON_SOCKET_PATH)
-        .await
-        .with_context(|| format!("failed to connect to daemon socket at {DAEMON_SOCKET_PATH}"))?;
+    let stream = connect_to_daemon_with_autostart().await?;
 
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -562,6 +734,17 @@ async fn stream_daemon_sessions_once(app: &AppHandle) -> Result<()> {
         .write_all(b"\n")
         .await
         .context("failed to write daemon request newline")?;
+
+    app.emit(
+        DAEMON_SESSION_EVENT,
+        DesktopSessionUpdate {
+            connected: true,
+            session_id: None,
+            state: Some("IDLE".to_string()),
+            error: None,
+        },
+    )
+    .context("failed to emit initial daemon session event")?;
 
     while let Some(line) = lines
         .next_line()
@@ -715,6 +898,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
@@ -819,5 +1003,75 @@ mod tests {
         let status = disconnected_status(format!("daemon status stream error: {err}"));
         assert!(status.diagnostics[0].contains("daemon status stream error"));
         assert!(status.diagnostics[0].contains("protocol mismatch"));
+    }
+
+    #[test]
+    fn format_start_session_error_adds_rebuild_hint_for_not_implemented() {
+        let message = format_start_session_error(
+            "NOT_IMPLEMENTED",
+            "Session start orchestration not implemented yet",
+        );
+
+        assert!(message.contains("scripts/dev-up.sh"));
+        assert!(message.contains("NOT_IMPLEMENTED"));
+    }
+
+    #[test]
+    fn format_start_session_error_keeps_standard_shape_for_other_codes() {
+        let message = format_start_session_error("SESSION_ALREADY_ACTIVE", "a session is already active");
+        assert_eq!(
+            message,
+            "daemon error SESSION_ALREADY_ACTIVE: a session is already active"
+        );
+    }
+
+    #[test]
+    fn is_socket_bootstrap_error_recognizes_not_found_and_connection_refused() {
+        let not_found = anyhow::Error::new(io::Error::new(io::ErrorKind::NotFound, "missing"));
+        let refused =
+            anyhow::Error::new(io::Error::new(io::ErrorKind::ConnectionRefused, "refused"));
+        let denied =
+            anyhow::Error::new(io::Error::new(io::ErrorKind::PermissionDenied, "denied"));
+
+        assert!(is_socket_bootstrap_error(&not_found));
+        assert!(is_socket_bootstrap_error(&refused));
+        assert!(!is_socket_bootstrap_error(&denied));
+    }
+
+    #[test]
+    fn daemon_launch_candidates_include_binary_candidate() {
+        let candidates = daemon_launch_candidates();
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.command == "openausweis-daemon")
+        );
+    }
+
+    #[test]
+    fn infer_workspace_root_points_to_repo_root() {
+        let root = infer_workspace_root().expect("workspace root should be inferable in tests");
+        let cargo_toml = root.join("Cargo.toml");
+        assert!(cargo_toml.exists(), "repo root should contain Cargo.toml");
+    }
+
+    #[test]
+    fn autostart_attempt_is_rate_limited_by_cooldown() {
+        let lock = DAEMON_START_STATE.get_or_init(|| {
+            Mutex::new(DaemonStartState {
+                last_attempt: None,
+            })
+        });
+
+        {
+            let mut state = lock.lock().expect("daemon start state lock poisoned");
+            state.last_attempt = None;
+        }
+
+        assert!(record_autostart_attempt());
+        assert!(!record_autostart_attempt());
+
+        let mut state = lock.lock().expect("daemon start state lock poisoned");
+        state.last_attempt = None;
     }
 }
