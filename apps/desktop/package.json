@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "vite --port ${OPENAUSWEIS_DESKTOP_PORT:-1420}",
     "build": "tsc -b && vite build",
     "lint": "echo \"No linter configured yet\"",
     "typecheck": "tsc --noEmit",
