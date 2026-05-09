@@ -68,6 +68,11 @@ docs/
 
 Foundation implementation started.
 
+Ubuntu 24.04 desktop migration started:
+
+- Track progress in `docs/UBUNTU_24_DESKTOP_MIGRATION.md`
+- Current desktop runtime migration focus is Tauri upgrade for native libsoup3-compatible execution on Ubuntu 24.04
+
 Implemented in this baseline:
 
 - Cargo workspace and Rust crate boundaries

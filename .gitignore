@@ -40,6 +40,8 @@ coverage/
 # Temporary
 tmp/
 temp/
+.libcompat/
+.pkgconfig/
 
 # Snap / Flatpak
 .snapcraft/

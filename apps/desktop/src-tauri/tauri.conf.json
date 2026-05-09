@@ -17,6 +17,9 @@
         "open": true
       }
     },
+    "systemTray": {
+      "iconPath": "icons/icon.png"
+    },
     "bundle": {
       "active": false,
       "identifier": "org.openausweis.desktop"
