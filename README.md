@@ -43,29 +43,41 @@ The project aims to provide:
 
 ```text
 apps/
-  desktop/
-  daemon/
-  browser-extension/
+  daemon/                # Rust daemon with Unix socket IPC endpoint
+  native-host/           # Browser native messaging host bridge
+  desktop/               # React frontend + Tauri shell
+    src-tauri/           # Native desktop runtime and tray integration
+  browser-extension/     # Chromium/Firefox extension scaffold
+
+crates/
+  openausweis-ipc/       # Shared Rust IPC contracts
+  openausweis-core/      # Core service traits and domain interfaces
+  openausweis-pcsc/      # PC/SC integration boundary (placeholder)
 
 packages/
-  ipc/
-  sdk/
-  shared-types/
+  shared-types/          # Shared TypeScript message contracts
 
 docs/
-  architecture/
-  planning/
-  security/
-  ux/
-  vision/
-  copilot/
+  DEVELOPMENT_WORKFLOW.md
+  ...existing architecture/planning docs
 ```
 
 ---
 
 # Current Status
 
-Early architecture and planning phase.
+Foundation implementation started.
+
+Implemented in this baseline:
+
+- Cargo workspace and Rust crate boundaries
+- Daemon process scaffold with Unix domain socket endpoint
+- Typed IPC contracts in Rust and TypeScript
+- Tauri desktop shell with tray menu baseline
+- React desktop UI shell for diagnostics/status
+- Browser extension scaffold with native messaging bridge
+- GitHub Actions CI workflows
+- Local development scripts and workflow doc
 
 ---
 

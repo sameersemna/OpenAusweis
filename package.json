@@ -1,0 +1,17 @@
+{
+  "name": "openausweis",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Linux-native German eID platform",
+  "workspaces": [
+    "apps/desktop",
+    "apps/browser-extension",
+    "packages/shared-types"
+  ],
+  "scripts": {
+    "build": "npm run --workspaces --if-present build",
+    "dev": "npm run --workspace @openausweis/desktop dev",
+    "lint": "npm run --workspaces --if-present lint",
+    "typecheck": "npm run --workspaces --if-present typecheck"
+  }
+}

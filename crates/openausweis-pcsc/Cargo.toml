@@ -1,0 +1,10 @@
+[package]
+name = "openausweis-pcsc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+openausweis-core = { path = "../openausweis-core" }
+async-trait.workspace = true
+tracing.workspace = true

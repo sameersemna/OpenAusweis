@@ -25,6 +25,28 @@ Potential threats:
 - sandbox desktop components
 - strict permission boundaries
 - avoid storing secrets
+- enforce relying-party origin allowlists in extension and native host
+
+## Browser Origin Policy
+
+- `START_SESSION` messages are accepted only when the sender origin equals the declared `relying_party`.
+- Extension background validates origin against local policy:
+	- exact origins from `chrome.storage.local.allowedExactOrigins`
+	- host suffixes from `chrome.storage.local.allowedSuffixes`
+	- defaults: `http://localhost`, `https://localhost`, `.bundid.de`, `.bund.de`
+
+## Native Host Origin Policy
+
+- Native host re-validates `START_SESSION.relying_party` before forwarding to daemon.
+- Native host reads policy from `~/.config/openausweis/origin-policy/current/` by default.
+- The `current` symlink points to a versioned bundle directory containing `policy.json` and `policy.sha256`.
+- Native host verifies the bundle checksum before accepting it.
+- `OPENAUSWEIS_POLICY_DIR` can point to an alternate bundle root.
+- `OPENAUSWEIS_POLICY_FILE` is accepted as a legacy compatibility read path.
+- Policy is configurable by environment variables:
+	- `OPENAUSWEIS_ALLOWED_EXACT_ORIGINS` (CSV exact origins)
+	- `OPENAUSWEIS_ALLOWED_SUFFIXES` (CSV domain suffixes)
+- Defaults mirror extension defaults for defense in depth.
 
 ## Authentication Philosophy
 

@@ -1,0 +1,9 @@
+{
+  "name": "org.openausweis.native",
+  "description": "OpenAusweis Native Messaging Host",
+  "path": "/usr/bin/openausweis-native-host",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://REPLACE_WITH_CHROMIUM_ID/"
+  ]
+}

@@ -1,0 +1,18 @@
+name: Release Plan Draft
+
+on:
+  workflow_dispatch:
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Summarize release tracks
+        run: |
+          echo "OpenAusweis release tracks:" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Desktop app packaging: Snap, Flatpak, AppImage" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Browser extension packaging: Chromium + Firefox" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Native messaging manifests: distro-specific installation paths" >> "$GITHUB_STEP_SUMMARY"
