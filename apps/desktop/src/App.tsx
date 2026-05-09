@@ -2,6 +2,27 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useEffect, useState } from "react";
 
+const THEME_STORAGE_KEY = "openausweis-theme";
+
+type ThemePreference = "system" | "light" | "dark";
+type ResolvedTheme = "light" | "dark";
+
+function getSystemTheme(): ResolvedTheme {
+  if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
+    return "light";
+  }
+
+  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
+function parseStoredTheme(value: string | null): ThemePreference {
+  if (value === "light" || value === "dark" || value === "system") {
+    return value;
+  }
+
+  return "system";
+}
+
 type DaemonStatus = {
   healthy: boolean;
   pcscAvailable: boolean;
@@ -24,6 +45,8 @@ type SessionUpdate = {
 };
 
 export function App() {
+  const [themePreference, setThemePreference] = useState<ThemePreference>("system");
+  const [resolvedTheme, setResolvedTheme] = useState<ResolvedTheme>(() => getSystemTheme());
   const [status, setStatus] = useState("Disconnected");
   const [details, setDetails] = useState("No probe executed yet");
   const [pcscAvailable, setPcscAvailable] = useState(false);
@@ -43,6 +66,39 @@ export function App() {
   const [submitPinBusy, setSubmitPinBusy] = useState(false);
   const [sessionResultMessage, setSessionResultMessage] = useState<string | null>(null);
   const [sessionCompletedAt, setSessionCompletedAt] = useState<string | null>(null);
+
+  useEffect(() => {
+    const storedPreference = parseStoredTheme(window.localStorage.getItem(THEME_STORAGE_KEY));
+    setThemePreference(storedPreference);
+  }, []);
+
+  useEffect(() => {
+    if (themePreference !== "system") {
+      setResolvedTheme(themePreference);
+      return;
+    }
+
+    const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
+    const applySystemTheme = (matchesDark: boolean) => {
+      setResolvedTheme(matchesDark ? "dark" : "light");
+    };
+
+    applySystemTheme(mediaQuery.matches);
+    const handleChange = (event: MediaQueryListEvent) => applySystemTheme(event.matches);
+
+    mediaQuery.addEventListener("change", handleChange);
+    return () => {
+      mediaQuery.removeEventListener("change", handleChange);
+    };
+  }, [themePreference]);
+
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", resolvedTheme);
+  }, [resolvedTheme]);
+
+  useEffect(() => {
+    window.localStorage.setItem(THEME_STORAGE_KEY, themePreference);
+  }, [themePreference]);
 
   useEffect(() => {
     void loadPolicy();
@@ -227,8 +283,35 @@ export function App() {
   return (
     <main className="app-shell">
       <section className="card">
-        <h1>OpenAusweis</h1>
-        <p className="subtitle">Linux-native German eID desktop companion</p>
+        <div className="top-row">
+          <div>
+            <h1>OpenAusweis</h1>
+            <p className="subtitle">Linux-native German eID desktop companion</p>
+          </div>
+          <div className="theme-controls" role="group" aria-label="Theme selection">
+            <button
+              type="button"
+              className={themePreference === "system" ? "secondary theme-button active" : "secondary theme-button"}
+              onClick={() => setThemePreference("system")}
+            >
+              System
+            </button>
+            <button
+              type="button"
+              className={themePreference === "light" ? "secondary theme-button active" : "secondary theme-button"}
+              onClick={() => setThemePreference("light")}
+            >
+              Light
+            </button>
+            <button
+              type="button"
+              className={themePreference === "dark" ? "secondary theme-button active" : "secondary theme-button"}
+              onClick={() => setThemePreference("dark")}
+            >
+              Dark
+            </button>
+          </div>
+        </div>
 
         <div className="status-row">
           <span className="label">Daemon</span>

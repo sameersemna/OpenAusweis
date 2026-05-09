@@ -2,12 +2,48 @@
   --bg-top: #f8f4ec;
   --bg-bottom: #dce7ef;
   --surface: #ffffffcc;
+  --surface-strong: #ffffff;
   --text: #182230;
   --muted: #5b6774;
   --primary: #0f6e83;
   --primary-hover: #0c5c6d;
   --secondary: #e7eef2;
   --border: #bed0da;
+  --panel-soft: #f2f8fb;
+  --badge-present-bg: #e8f7e8;
+  --badge-present-text: #1f6f2f;
+  --badge-present-border: #9ed5a5;
+  --badge-absent-bg: #f5f1e7;
+  --badge-absent-text: #806124;
+  --badge-absent-border: #e2cf98;
+  --error: #8b2f2f;
+  --success: #1f6f2f;
+  --code-bg: #e3edf2;
+  --overlay: rgba(8, 21, 33, 0.45);
+}
+
+:root[data-theme="dark"] {
+  --bg-top: #121920;
+  --bg-bottom: #1e2a35;
+  --surface: rgba(26, 37, 48, 0.9);
+  --surface-strong: #1a2530;
+  --text: #e6edf4;
+  --muted: #acbac8;
+  --primary: #2a9ab3;
+  --primary-hover: #22839a;
+  --secondary: #2a3a4a;
+  --border: #3e5467;
+  --panel-soft: #223240;
+  --badge-present-bg: #234634;
+  --badge-present-text: #c9f6d7;
+  --badge-present-border: #3f8f62;
+  --badge-absent-bg: #473a22;
+  --badge-absent-text: #ffe1ab;
+  --badge-absent-border: #8f7040;
+  --error: #ff8f8f;
+  --success: #7ce09a;
+  --code-bg: #2b3f50;
+  --overlay: rgba(5, 9, 14, 0.6);
 }
 
 * {
@@ -39,6 +75,30 @@ body {
   box-shadow: 0 18px 45px rgba(17, 42, 58, 0.12);
 }
 
+.top-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.8rem;
+}
+
+.theme-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  justify-content: flex-end;
+}
+
+.theme-button {
+  padding: 0.45rem 0.6rem;
+  font-size: 0.8rem;
+}
+
+.theme-button.active {
+  background: var(--primary);
+  color: #fff;
+}
+
 h1 {
   margin: 0;
   font-size: 1.75rem;
@@ -54,7 +114,7 @@ h1 {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  background: #f2f8fb;
+  background: var(--panel-soft);
   border: 1px solid var(--border);
   border-radius: 0.7rem;
   padding: 0.85rem 1rem;
@@ -103,16 +163,16 @@ h1 {
 }
 
 .value.good {
-  color: #1f6f2f;
+  color: var(--success);
 }
 
 .value.bad {
-  color: #8b2f2f;
+  color: var(--error);
 }
 
 .session-result {
   margin-top: 0.7rem;
-  color: #1f6f2f;
+  color: var(--success);
   font-size: 0.9rem;
   font-weight: 600;
 }
@@ -163,28 +223,28 @@ h1 {
 }
 
 .badge.present {
-  background: #e8f7e8;
-  color: #1f6f2f;
-  border-color: #9ed5a5;
+  background: var(--badge-present-bg);
+  color: var(--badge-present-text);
+  border-color: var(--badge-present-border);
 }
 
 .badge.absent {
-  background: #f5f1e7;
-  color: #806124;
-  border-color: #e2cf98;
+  background: var(--badge-absent-bg);
+  color: var(--badge-absent-text);
+  border-color: var(--badge-absent-border);
 }
 
 .reader-error {
   margin: 0.35rem 0 0;
-  color: #8b2f2f;
+  color: var(--error);
   font-size: 0.86rem;
 }
 
 .hotplug-guide {
   margin-top: 1rem;
-  border: 1px solid #d9e6ed;
+  border: 1px solid var(--border);
   border-radius: 0.65rem;
-  background: #f4f9fb;
+  background: var(--panel-soft);
   padding: 0.75rem 0.9rem;
 }
 
@@ -217,7 +277,7 @@ h1 {
 }
 
 .hotplug-step code {
-  background: #e3edf2;
+  background: var(--code-bg);
   border-radius: 0.3rem;
   padding: 0.05rem 0.35rem;
   font-size: 0.83rem;
@@ -245,7 +305,7 @@ textarea {
   padding: 0.6rem 0.7rem;
   font: inherit;
   color: var(--text);
-  background: #fcfefe;
+  background: var(--surface-strong);
 }
 
 textarea:focus {
@@ -280,7 +340,7 @@ button:disabled {
 .modal-backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(8, 21, 33, 0.45);
+  background: var(--overlay);
   display: grid;
   place-items: center;
   padding: 1rem;
@@ -289,7 +349,7 @@ button:disabled {
 
 .pin-modal {
   width: min(25rem, 100%);
-  background: #ffffff;
+  background: var(--surface-strong);
   border: 1px solid var(--border);
   border-radius: 0.9rem;
   padding: 1rem 1.1rem;
@@ -309,7 +369,7 @@ button:disabled {
   font: inherit;
   font-size: 1rem;
   letter-spacing: 0.3rem;
-  background: #fcfefe;
+  background: var(--surface-strong);
 }
 
 .pin-input:focus {
@@ -318,6 +378,14 @@ button:disabled {
 }
 
 @media (max-width: 640px) {
+  .top-row {
+    flex-direction: column;
+  }
+
+  .theme-controls {
+    justify-content: flex-start;
+  }
+
   .actions {
     flex-direction: column;
   }
