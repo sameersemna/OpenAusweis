@@ -8,9 +8,10 @@ use sha2::{Digest, Sha256};
 use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::path::PathBuf;
-use tauri::{CustomMenuItem, Manager, SystemTray, SystemTrayEvent, SystemTrayMenu};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::TrayIconBuilder;
 use uuid::Uuid;
 
 const DAEMON_SOCKET_PATH: &str = "/tmp/openausweis-daemon.sock";
@@ -350,25 +351,27 @@ async fn get_daemon_status() -> Result<DesktopDaemonStatus> {
     }
 }
 
-fn main() {
-    let show = CustomMenuItem::new("show", "Show OpenAusweis");
-    let quit = CustomMenuItem::new("quit", "Quit");
-    let tray_menu = SystemTrayMenu::new().add_item(show).add_item(quit);
+fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
+    let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let tray_menu = Menu::with_items(app, &[&quit_item])?;
+    let quit_id = quit_item.id().clone();
 
-    tauri::Builder::default()
-        .system_tray(SystemTray::new().with_menu(tray_menu))
-        .on_system_tray_event(|app, event| match event {
-            SystemTrayEvent::MenuItemClick { id, .. } if id == "show" => {
-                if let Some(window) = app.get_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
+    TrayIconBuilder::with_id("main")
+        .menu(&tray_menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(move |app_handle, event| {
+            if event.id() == &quit_id {
+                app_handle.exit(0);
             }
-            SystemTrayEvent::MenuItemClick { id, .. } if id == "quit" => {
-                app.exit(0);
-            }
-            _ => {}
         })
+        .build(app)?;
+
+    Ok(())
+}
+
+fn main() {
+    tauri::Builder::default()
+        .setup(|app| setup_tray(app).map_err(Into::into))
         .invoke_handler(tauri::generate_handler![
             probe_daemon_status,
             get_origin_policy,

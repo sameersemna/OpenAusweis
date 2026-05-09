@@ -22,7 +22,6 @@ logs/
 .env.*.local
 
 # IDE
-.vscode/
 .idea/
 
 # OS
@@ -49,6 +48,9 @@ temp/
 
 # Generated
 generated/
+
+# Desktop TS transpilation artifacts
+apps/desktop/src/*.js
 
 # Secrets
 *.pem

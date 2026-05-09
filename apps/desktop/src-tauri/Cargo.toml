@@ -5,10 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [build-dependencies]
-tauri-build = { version = "1", features = [] }
+tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "1", features = [ "system-tray", "shell-open"] }
+tauri = { version = "2", features = ["tray-icon"] }
 anyhow.workspace = true
 openausweis-ipc = { path = "../../../crates/openausweis-ipc" }
 sha2.workspace = true

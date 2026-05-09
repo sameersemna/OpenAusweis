@@ -84,6 +84,10 @@ Implemented in this baseline:
 - GitHub Actions CI workflows
 - Local development scripts and workflow doc
 
+Desktop run note (VS Code Snap on Linux):
+
+- Use `npm run --workspace @openausweis/desktop tauri:dev:snap-safe` to avoid Snap-injected GTK/GIO runtime path conflicts.
+
 ---
 
 # License

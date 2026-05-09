@@ -21,7 +21,13 @@ Run the desktop app on Ubuntu 24.04 without local linker hacks, local pkg-config
 - Temporary local compatibility shims were removed from repository state.
 - Tauri CLI is available in the desktop workspace.
 - Desktop config includes explicit tray configuration and icon path.
-- Remaining blocker is framework/runtime compatibility with Ubuntu 24.04 library stack.
+- Desktop app started migration to Tauri v2 config and dependency baselines.
+- Frontend invoke path migrated to `@tauri-apps/api/core`.
+- Tray configuration moved to Tauri v2 schema key `app.trayIcon`.
+- Tauri v2 tray Rust wiring reintroduced using `tauri::tray::TrayIconBuilder` and v2 `menu` APIs.
+- `cargo check -p openausweis-desktop` now succeeds on Tauri v2.
+- `tauri dev` compiles and launches without libsoup symbol conflicts.
+- In VS Code Snap shells, runtime may fail unless Snap-injected GTK/GIO variables are cleared.
 
 ## Migration Strategy
 
@@ -53,11 +59,19 @@ Run the desktop app on Ubuntu 24.04 without local linker hacks, local pkg-config
 
 ## Technical Checklist
 
-- [ ] Tauri v2 dependency updates applied in desktop package and Rust manifest.
-- [ ] Tray setup migrated from v1 to v2 APIs.
-- [ ] Desktop commands compile and execute under v2 runtime.
-- [ ] Ubuntu 24.04 local `tauri dev` runs without libsoup symbol conflicts.
+- [x] Tauri v2 dependency updates applied in desktop package and Rust manifest.
+- [x] Tray setup migrated from v1 to v2 APIs.
+- [x] Desktop commands compile and execute under v2 runtime.
+- [x] Ubuntu 24.04 local `tauri dev` runs without libsoup symbol conflicts.
 - [ ] CI updated for desktop runtime coverage.
+
+## Runtime Note (VS Code Snap)
+
+If you run commands from VS Code installed as Snap, Snap environment variables can inject incompatible GTK/GIO runtime paths and trigger glibc symbol lookup failures.
+
+Use:
+
+- `npm run --workspace @openausweis/desktop tauri:dev:snap-safe`
 
 ## Risk Notes
 

@@ -7,15 +7,17 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "echo \"No linter configured yet\"",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "tauri:dev": "npx tauri dev",
+    "tauri:dev:snap-safe": "env -u GTK_EXE_PREFIX -u GTK_PATH -u GIO_MODULE_DIR -u GTK_IM_MODULE_FILE -u LOCPATH -u LD_LIBRARY_PATH -u PKG_CONFIG_PATH CARGO_BUILD_JOBS=1 npx tauri dev"
   },
   "dependencies": {
-    "@tauri-apps/api": "^1.6.0",
+    "@tauri-apps/api": "^2.0.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^1.6.3",
+    "@tauri-apps/cli": "^2.0.0",
     "@types/react": "^18.3.8",
     "@types/react-dom": "^18.3.0",
     "typescript": "^5.8.3",

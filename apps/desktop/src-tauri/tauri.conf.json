@@ -1,28 +1,17 @@
 {
-  "$schema": "https://schema.tauri.app/config/1",
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "OpenAusweis",
+  "version": "0.1.0",
+  "identifier": "org.openausweis.desktop",
   "build": {
     "beforeDevCommand": "npm run dev --workspace @openausweis/desktop",
     "beforeBuildCommand": "npm run build --workspace @openausweis/desktop",
-    "devPath": "http://localhost:1420",
-    "distDir": "../dist"
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
   },
-  "package": {
-    "productName": "OpenAusweis",
-    "version": "0.1.0"
-  },
-  "tauri": {
-    "allowlist": {
-      "all": false,
-      "shell": {
-        "open": true
-      }
-    },
-    "systemTray": {
+  "app": {
+    "trayIcon": {
       "iconPath": "icons/icon.png"
-    },
-    "bundle": {
-      "active": false,
-      "identifier": "org.openausweis.desktop"
     },
     "windows": [
       {
@@ -32,5 +21,8 @@
         "resizable": true
       }
     ]
+  },
+  "bundle": {
+    "active": false
   }
 }
