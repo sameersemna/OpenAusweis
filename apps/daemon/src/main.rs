@@ -9,7 +9,7 @@ use openausweis_ipc::{
 };
 use openausweis_pcsc::PcscSubsystem;
 use session::SessionManager;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration as StdDuration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedWriteHalf;
@@ -27,6 +27,8 @@ const WATCH_SESSIONS_MIN_INTERVAL_MS: u64 = 250;
 #[cfg(test)]
 const WATCH_SESSIONS_MIN_INTERVAL_MS: u64 = 20;
 const SESSION_TTL_SECONDS: u64 = 5 * 60;
+
+static LAST_LOGGED_PCSC_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -246,9 +248,7 @@ async fn build_daemon_status(
     let diagnostics = snapshot.diagnostics;
     let last_error = snapshot.last_error;
 
-    if let Some(message) = &last_error {
-        warn!(error = %message, "pcsc snapshot reported error");
-    }
+    log_pcsc_error_if_changed(&last_error);
 
     DaemonStatus {
         healthy: true,
@@ -266,6 +266,26 @@ async fn build_daemon_status(
         diagnostics,
         last_error,
     }
+}
+
+fn log_pcsc_error_if_changed(last_error: &Option<String>) {
+    let lock = LAST_LOGGED_PCSC_ERROR.get_or_init(|| Mutex::new(None));
+    let mut previous = lock.lock().expect("pcsc error log state lock poisoned");
+
+    if !should_log_pcsc_error_transition(&previous, last_error) {
+        return;
+    }
+
+    match last_error {
+        Some(message) => warn!(error = %message, "pcsc snapshot reported error"),
+        None => info!("pcsc snapshot error cleared"),
+    }
+
+    *previous = last_error.clone();
+}
+
+fn should_log_pcsc_error_transition(previous: &Option<String>, current: &Option<String>) -> bool {
+    previous != current
 }
 
 async fn route_request(
@@ -813,5 +833,48 @@ mod tests {
 
         drop(lines);
         task.abort();
+    }
+
+    #[test]
+    fn should_log_pcsc_error_transition_only_on_change() {
+        assert!(should_log_pcsc_error_transition(&None, &Some("x".to_string())));
+        assert!(should_log_pcsc_error_transition(&Some("x".to_string()), &None));
+        assert!(should_log_pcsc_error_transition(
+            &Some("x".to_string()),
+            &Some("y".to_string())
+        ));
+        assert!(!should_log_pcsc_error_transition(
+            &Some("x".to_string()),
+            &Some("x".to_string())
+        ));
+        assert!(!should_log_pcsc_error_transition(&None, &None));
+    }
+
+    #[test]
+    fn repeated_identical_pcsc_errors_only_trigger_single_transition() {
+        let samples = vec![
+            None,
+            Some("reader busy".to_string()),
+            Some("reader busy".to_string()),
+            Some("reader busy".to_string()),
+            None,
+            None,
+            Some("reader busy".to_string()),
+        ];
+
+        let mut previous: Option<String> = None;
+        let mut transitions = 0_u32;
+
+        for sample in samples {
+            if should_log_pcsc_error_transition(&previous, &sample) {
+                transitions = transitions.saturating_add(1);
+                previous = sample;
+            }
+        }
+
+        assert_eq!(
+            transitions, 3,
+            "expected transitions: enter error, clear error, re-enter same error"
+        );
     }
 }
