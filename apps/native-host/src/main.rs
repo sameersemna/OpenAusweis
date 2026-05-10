@@ -12,7 +12,7 @@ use tokio::time::{timeout, Duration};
 use url::Url;
 use uuid::Uuid;
 
-const DAEMON_SOCKET_PATH: &str = "/tmp/openausweis-daemon.sock";
+const DAEMON_SOCKET_PATH_FALLBACK: &str = "/tmp/openausweis-daemon.sock";
 const WATCH_SESSIONS_FIRST_EVENT_TIMEOUT_MS: u64 = 4500;
 
 const DEFAULT_ALLOWED_EXACT_ORIGINS: &[&str] = &["http://localhost", "https://localhost"];
@@ -122,7 +122,7 @@ async fn main() -> Result<()> {
 fn validate_client_request(request: &ClientRequest) -> Result<()> {
     let policy = load_origin_policy();
     match request {
-        ClientRequest::StartSession { relying_party } => {
+        ClientRequest::StartSession { relying_party, .. } => {
             if !is_origin_allowed(relying_party, &policy)? {
                 return Err(anyhow::anyhow!(
                     "relying party origin is not allowed: {relying_party}"
@@ -132,6 +132,24 @@ fn validate_client_request(request: &ClientRequest) -> Result<()> {
         }
         _ => Ok(()),
     }
+}
+
+fn daemon_socket_path() -> PathBuf {
+    if let Ok(path) = std::env::var("OPENAUSWEIS_DAEMON_SOCKET") {
+        if !path.trim().is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+
+    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        if !runtime_dir.trim().is_empty() {
+            return PathBuf::from(runtime_dir)
+                .join("openausweis")
+                .join("daemon.sock");
+        }
+    }
+
+    PathBuf::from(DAEMON_SOCKET_PATH_FALLBACK)
 }
 
 fn load_origin_policy() -> OriginPolicy {
@@ -367,10 +385,16 @@ async fn forward_to_daemon(
     request: RpcEnvelope<ClientRequest>,
 ) -> Result<RpcEnvelope<DaemonResponse>> {
     let wait_for_first_event = matches!(&request.payload, ClientRequest::WatchSessions { .. });
+    let socket_path = daemon_socket_path();
 
-    let stream = UnixStream::connect(DAEMON_SOCKET_PATH)
+    let stream = UnixStream::connect(&socket_path)
         .await
-        .with_context(|| format!("failed to connect to daemon socket at {DAEMON_SOCKET_PATH}"))?;
+        .with_context(|| {
+            format!(
+                "failed to connect to daemon socket at {}",
+                socket_path.display()
+            )
+        })?;
 
     let (reader, mut writer) = stream.into_split();
     let mut daemon_lines = BufReader::new(reader).lines();

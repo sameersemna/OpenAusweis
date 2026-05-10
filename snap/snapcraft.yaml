@@ -1,0 +1,39 @@
+name: openausweis
+base: core24
+version: 0.1.0
+summary: Linux-native German eID desktop platform
+description: |
+  OpenAusweis provides Linux-native German eID desktop and browser integration.
+  This scaffold defines expected interfaces and desktop launch wiring for Ubuntu 24+.
+
+grade: devel
+confinement: strict
+
+apps:
+  openausweis:
+    command: bin/openausweis-desktop-launch
+    daemon: simple
+    restart-condition: on-failure
+    plugs:
+      - desktop
+      - desktop-legacy
+      - wayland
+      - x11
+      - unity7
+      - network
+      - network-bind
+      - home
+      - raw-usb
+      - hardware-observe
+      - avahi-observe
+
+parts:
+  launcher:
+    plugin: dump
+    source: .
+    organize:
+      scripts/snap/openausweis-desktop-launch: bin/openausweis-desktop-launch
+
+  # Placeholder part until release build artifacts are wired into CI packaging.
+  desktop-binaries:
+    plugin: nil

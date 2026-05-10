@@ -173,6 +173,61 @@ sudo apt install -y pcscd libpcsclite1 libpcsclite-dev pkgconf pcsc-tools
 sudo systemctl enable --now pcscd
 ```
 
+Linux packaging/runtime readiness check:
+
+```bash
+npm run validate:linux-packaging
+```
+
+This validates Ubuntu baseline, GNOME/Wayland session hints, daemon socket layout,
+native messaging host registration paths, and Snap/Flatpak runtime availability.
+
+Native host install helper (Chromium + optional Firefox):
+
+```bash
+# Chromium only
+scripts/install-native-host.sh <CHROMIUM_EXTENSION_ID>
+
+# Chromium + Firefox add-on ID
+scripts/install-native-host.sh <CHROMIUM_EXTENSION_ID> ./target/debug/openausweis-native-host <FIREFOX_ADDON_ID>
+```
+
+Firefox-only install helper:
+
+```bash
+scripts/install-native-host-firefox.sh <FIREFOX_ADDON_ID> [BINARY_PATH]
+```
+
+The packaging validator now prints actionable fix commands for each warning:
+
+```bash
+npm run validate:linux-packaging
+```
+
+One-step native host setup plus validation:
+
+```bash
+scripts/setup-native-host.sh --chromium-id <CHROMIUM_EXTENSION_ID>
+scripts/setup-native-host.sh --firefox-id <FIREFOX_ADDON_ID>
+scripts/setup-native-host.sh --chromium-id <CHROMIUM_EXTENSION_ID> --firefox-id <FIREFOX_ADDON_ID>
+```
+
+Non-interactive manifest ID drift verification:
+
+```bash
+scripts/validate-linux-packaging.sh --expect-chromium-id <CHROMIUM_EXTENSION_ID>
+scripts/validate-linux-packaging.sh --expect-firefox-id <FIREFOX_ADDON_ID>
+scripts/validate-linux-packaging.sh --expect-chromium-id <CHROMIUM_EXTENSION_ID> --expect-firefox-id <FIREFOX_ADDON_ID>
+```
+
+You can also use env-based npm wiring:
+
+```bash
+OPENAUSWEIS_EXPECTED_CHROMIUM_EXTENSION_ID=<CHROMIUM_EXTENSION_ID> \
+OPENAUSWEIS_EXPECTED_FIREFOX_ADDON_ID=<FIREFOX_ADDON_ID> \
+npm run validate:linux-packaging:expected
+```
+
 ---
 
 # License

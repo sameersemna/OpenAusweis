@@ -2,9 +2,196 @@ const NATIVE_HOST = "org.openausweis.native";
 const PROTOCOL_VERSION = 1;
 const DEFAULT_ALLOWED_EXACT_ORIGINS = ["http://localhost", "https://localhost"];
 const DEFAULT_ALLOWED_SUFFIXES = [".bundid.de", ".bund.de"];
+const NATIVE_REQUEST_TIMEOUT_MS = 6000;
+const NATIVE_IDLE_DISCONNECT_MS = 15000;
+const WATCH_SESSIONS_INTERVAL_MS = 500;
+const WATCH_RETRY_DELAY_MS = 200;
+const WATCH_IDLE_DELAY_MS = 120;
+const SESSION_COMPLETION_TIMEOUT_MS = 120000;
+
+const activeSessionWaits = new Map();
+const bridgeMetrics = {
+  nativeDisconnects: 0,
+  nativeTimeouts: 0,
+  watchRetries: 0,
+  daemonErrors: 0,
+  sessionStarts: 0,
+  sessionCompletions: 0,
+  sessionGuardRejects: 0,
+  waitAborts: 0,
+  lastError: null,
+  updatedAt: null,
+};
+
+const nativeClient = createNativeClient();
 
 function connectNativeHost() {
   return chrome.runtime.connectNative(NATIVE_HOST);
+}
+
+function createRequestId() {
+  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
+    return globalThis.crypto.randomUUID();
+  }
+
+  const random = Math.random().toString(16).slice(2);
+  return `fallback-${Date.now()}-${random}`;
+}
+
+function createAbortError(message) {
+  const error = new Error(message);
+  error.name = "AbortError";
+  return error;
+}
+
+function recordMetric(key, value = null) {
+  if (Object.prototype.hasOwnProperty.call(bridgeMetrics, key)) {
+    if (typeof bridgeMetrics[key] === "number") {
+      bridgeMetrics[key] += 1;
+    } else {
+      bridgeMetrics[key] = value;
+    }
+  }
+
+  bridgeMetrics.updatedAt = new Date().toISOString();
+}
+
+function setLastBridgeError(error) {
+  bridgeMetrics.lastError = String(error);
+  bridgeMetrics.updatedAt = new Date().toISOString();
+}
+
+function createNativeClient() {
+  let port = null;
+  const pendingByRequestId = new Map();
+  let idleDisconnectTimer = null;
+
+  function clearIdleDisconnectTimer() {
+    if (idleDisconnectTimer !== null) {
+      clearTimeout(idleDisconnectTimer);
+      idleDisconnectTimer = null;
+    }
+  }
+
+  function scheduleIdleDisconnect() {
+    clearIdleDisconnectTimer();
+    if (!port || pendingByRequestId.size > 0) {
+      return;
+    }
+
+    idleDisconnectTimer = setTimeout(() => {
+      if (!port || pendingByRequestId.size > 0) {
+        return;
+      }
+
+      try {
+        port.disconnect();
+      } catch (_) {}
+
+      port = null;
+      idleDisconnectTimer = null;
+    }, NATIVE_IDLE_DISCONNECT_MS);
+  }
+
+  function rejectAllPending(error) {
+    for (const pending of pendingByRequestId.values()) {
+      clearTimeout(pending.timeoutHandle);
+      pending.reject(error);
+    }
+    pendingByRequestId.clear();
+  }
+
+  function ensureConnected() {
+    if (port) {
+      return port;
+    }
+
+    port = connectNativeHost();
+
+    port.onMessage.addListener((response) => {
+      const requestId = response?.request_id;
+      if (typeof requestId !== "string") {
+        return;
+      }
+
+      const pending = pendingByRequestId.get(requestId);
+      if (!pending) {
+        return;
+      }
+
+      pendingByRequestId.delete(requestId);
+      clearTimeout(pending.timeoutHandle);
+
+      try {
+        validateNativeResponse(response, pending.requestEnvelope);
+        pending.resolve(response.payload);
+      } catch (error) {
+        pending.reject(error);
+      }
+
+      scheduleIdleDisconnect();
+    });
+
+    port.onDisconnect.addListener(() => {
+      const runtimeError = chrome.runtime.lastError;
+      const message = runtimeError?.message || "Native host disconnected";
+      const error = new Error(message);
+      recordMetric("nativeDisconnects");
+      setLastBridgeError(error);
+      clearIdleDisconnectTimer();
+      rejectAllPending(error);
+      port = null;
+    });
+
+    return port;
+  }
+
+  async function send(requestEnvelope, timeoutMs = NATIVE_REQUEST_TIMEOUT_MS) {
+    return new Promise((resolve, reject) => {
+      const currentPort = ensureConnected();
+      clearIdleDisconnectTimer();
+
+      const timeoutHandle = setTimeout(() => {
+        pendingByRequestId.delete(requestEnvelope.request_id);
+        recordMetric("nativeTimeouts");
+        reject(new Error("Native host timed out"));
+        scheduleIdleDisconnect();
+      }, timeoutMs);
+
+      pendingByRequestId.set(requestEnvelope.request_id, {
+        requestEnvelope,
+        resolve,
+        reject,
+        timeoutHandle,
+      });
+
+      try {
+        currentPort.postMessage(requestEnvelope);
+      } catch (error) {
+        pendingByRequestId.delete(requestEnvelope.request_id);
+        clearTimeout(timeoutHandle);
+        reject(error);
+        scheduleIdleDisconnect();
+      }
+    });
+  }
+
+  function disconnect() {
+    clearIdleDisconnectTimer();
+    if (!port) {
+      return;
+    }
+
+    try {
+      port.disconnect();
+    } catch (_) {}
+    port = null;
+  }
+
+  return {
+    send,
+    disconnect,
+  };
 }
 
 function parseOrigin(urlLike) {
@@ -98,13 +285,21 @@ function buildPayload(message) {
     }
     case "START_SESSION": {
       const relyingParty = message.relying_party;
+      const handoffId = message.handoff_id;
       if (typeof relyingParty !== "string" || relyingParty.length === 0) {
         throw new Error("START_SESSION requires relying_party");
       }
 
+      if (handoffId !== undefined && (typeof handoffId !== "string" || handoffId.length === 0)) {
+        throw new Error("START_SESSION handoff_id must be a non-empty string when provided");
+      }
+
       return {
         type: "START_SESSION",
-        data: { relying_party: relyingParty },
+        data: {
+          relying_party: relyingParty,
+          handoff_id: handoffId,
+        },
       };
     }
     case "SUBMIT_PIN": {
@@ -141,7 +336,7 @@ function buildPayload(message) {
 function buildRequestEnvelope(message) {
   return {
     protocol_version: PROTOCOL_VERSION,
-    request_id: crypto.randomUUID(),
+    request_id: createRequestId(),
     payload: buildPayload(message),
   };
 }
@@ -168,63 +363,70 @@ function validateNativeResponse(response, requestEnvelope) {
   }
 }
 
-async function sendNative(requestEnvelope) {
-  return new Promise((resolve, reject) => {
-    const port = connectNativeHost();
-    let settled = false;
-
-    const timeout = setTimeout(() => {
-      try {
-        port.disconnect();
-      } catch (_) {}
-      settled = true;
-      reject(new Error("Native host timed out"));
-    }, 5000);
-
-    port.onMessage.addListener((response) => {
-      if (settled) {
-        return;
-      }
-
-      settled = true;
-      clearTimeout(timeout);
-      try {
-        validateNativeResponse(response, requestEnvelope);
-        resolve(response.payload);
-      } catch (error) {
-        reject(error);
-      }
-      port.disconnect();
-    });
-
-    port.onDisconnect.addListener(() => {
-      if (settled) {
-        return;
-      }
-
-      const error = chrome.runtime.lastError;
-      if (error) {
-        settled = true;
-        clearTimeout(timeout);
-        reject(new Error(error.message));
-      }
-    });
-
-    port.postMessage(requestEnvelope);
-  });
-}
-
 function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function waitForSessionCompletion(sessionId, timeoutMs = 120000) {
+function sessionWaitKey(sender) {
+  const tabId = sender?.tab?.id;
+  if (Number.isInteger(tabId)) {
+    return `tab:${tabId}`;
+  }
+
+  const origin = parseOrigin(sender?.url);
+  if (origin) {
+    return `origin:${origin}`;
+  }
+
+  return "unknown";
+}
+
+function maybeAbortWaitForCancelledSession(sessionId) {
+  for (const waitState of activeSessionWaits.values()) {
+    if (waitState.sessionId === sessionId) {
+      recordMetric("waitAborts");
+      waitState.abortController.abort();
+    }
+  }
+}
+
+function isRetryableWatchError(error) {
+  const message = String(error);
+  return (
+    message.includes("timed out") ||
+    message.includes("session stream event") ||
+    message.includes("Native host timed out") ||
+    message.includes("DAEMON_UNAVAILABLE")
+  );
+}
+
+function parseDaemonPayloadError(payload) {
+  recordMetric("daemonErrors");
+  const code = payload?.data?.code;
+  const message = payload?.data?.message;
+  const codeText = typeof code === "string" ? code : "UNKNOWN";
+  const messageText = typeof message === "string" ? message : "daemon error";
+  const error = new Error(`Daemon error ${codeText}: ${messageText}`);
+  setLastBridgeError(error);
+  return error;
+}
+
+async function waitForSessionCompletion(sessionId, options = {}) {
+  const timeoutMs = Number.isFinite(options.timeoutMs)
+    ? Number(options.timeoutMs)
+    : SESSION_COMPLETION_TIMEOUT_MS;
+  const abortSignal = options.abortSignal;
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
+    if (abortSignal?.aborted) {
+      throw createAbortError("Session wait aborted");
+    }
+
     try {
-      const payload = await sendNative(
-        buildRequestEnvelope({ type: "WATCH_SESSIONS", interval_ms: 500 })
+      const payload = await nativeClient.send(
+        buildRequestEnvelope({ type: "WATCH_SESSIONS", interval_ms: WATCH_SESSIONS_INTERVAL_MS }),
+        NATIVE_REQUEST_TIMEOUT_MS
       );
 
       if (payload?.type === "SESSION_UPDATED") {
@@ -249,21 +451,26 @@ async function waitForSessionCompletion(sessionId, timeoutMs = 120000) {
           return payload;
         }
       }
+
+      if (payload?.type === "ERROR") {
+        throw parseDaemonPayloadError(payload);
+      }
     } catch (error) {
-      const message = String(error);
-      if (
-        message.includes("timed out") ||
-        message.includes("session stream event") ||
-        message.includes("Native host timed out")
-      ) {
-        await wait(200);
+      if (abortSignal?.aborted) {
+        throw createAbortError("Session wait aborted");
+      }
+
+      if (isRetryableWatchError(error)) {
+        recordMetric("watchRetries");
+        await wait(WATCH_RETRY_DELAY_MS);
         continue;
       }
 
+      setLastBridgeError(error);
       throw error;
     }
 
-    await wait(120);
+    await wait(WATCH_IDLE_DELAY_MS);
   }
 
   throw new Error("Session timed out while waiting for completion");
@@ -271,28 +478,84 @@ async function waitForSessionCompletion(sessionId, timeoutMs = 120000) {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
-    await validateStartSessionOrigin(message, sender);
-
-    const requestEnvelope = buildRequestEnvelope(message);
-    const response = await sendNative(requestEnvelope);
-
-    if (message?.type === "START_SESSION" && response?.type === "SESSION_STARTED") {
-      const sessionId = response?.data?.session_id;
-      if (typeof sessionId !== "string" || sessionId.length === 0) {
-        throw new Error("SESSION_STARTED did not provide a session_id");
-      }
-
-      const completionResponse = await waitForSessionCompletion(sessionId);
-      sendResponse({
-        ok: true,
-        response: completionResponse,
-        sessionStarted: response,
-      });
+    if (message?.type === "GET_BRIDGE_DIAGNOSTICS") {
+      sendResponse({ ok: true, diagnostics: { ...bridgeMetrics } });
       return;
     }
 
+    await validateStartSessionOrigin(message, sender);
+
+    if (message?.type === "CANCEL_SESSION") {
+      maybeAbortWaitForCancelledSession(message?.session_id);
+    }
+
+    if (message?.type === "START_SESSION") {
+      const startMessage = {
+        ...message,
+        handoff_id:
+          typeof message.handoff_id === "string" && message.handoff_id.length > 0
+            ? message.handoff_id
+            : `ext-${createRequestId()}`,
+      };
+
+      const key = sessionWaitKey(sender);
+      if (activeSessionWaits.has(key)) {
+        recordMetric("sessionGuardRejects");
+        throw new Error("A session is already in progress for this browser context");
+      }
+
+      const waitState = {
+        abortController: new AbortController(),
+        sessionId: null,
+      };
+      activeSessionWaits.set(key, waitState);
+
+      try {
+        recordMetric("sessionStarts");
+        const requestEnvelope = buildRequestEnvelope(startMessage);
+        const response = await nativeClient.send(requestEnvelope, NATIVE_REQUEST_TIMEOUT_MS);
+
+        if (response?.type !== "SESSION_STARTED") {
+          if (response?.type === "ERROR") {
+            throw parseDaemonPayloadError(response);
+          }
+
+          sendResponse({ ok: true, response });
+          return;
+        }
+
+        const sessionId = response?.data?.session_id;
+        if (typeof sessionId !== "string" || sessionId.length === 0) {
+          throw new Error("SESSION_STARTED did not provide a session_id");
+        }
+
+        waitState.sessionId = sessionId;
+
+        const completionResponse = await waitForSessionCompletion(sessionId, {
+          timeoutMs: SESSION_COMPLETION_TIMEOUT_MS,
+          abortSignal: waitState.abortController.signal,
+        });
+
+        sendResponse({
+          ok: true,
+          response: completionResponse,
+          sessionStarted: response,
+        });
+        recordMetric("sessionCompletions");
+        return;
+      } finally {
+        activeSessionWaits.delete(key);
+      }
+    }
+
+    const requestEnvelope = buildRequestEnvelope(message);
+    const response = await nativeClient.send(requestEnvelope, NATIVE_REQUEST_TIMEOUT_MS);
+
     sendResponse({ ok: true, response });
-  })().catch((error) => sendResponse({ ok: false, error: String(error) }));
+  })().catch((error) => {
+    setLastBridgeError(error);
+    sendResponse({ ok: false, error: String(error) });
+  });
 
   return true;
 });

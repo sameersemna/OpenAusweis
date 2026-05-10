@@ -9,6 +9,7 @@ use openausweis_ipc::{
 };
 use openausweis_pcsc::PcscSubsystem;
 use session::SessionManager;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration as StdDuration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -17,7 +18,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::time::{sleep, Duration as TokioDuration};
 use tracing::{error, info, warn};
 
-const SOCKET_PATH: &str = "/tmp/openausweis-daemon.sock";
+const SOCKET_PATH_FALLBACK: &str = "/tmp/openausweis-daemon.sock";
 #[cfg(not(test))]
 const WATCH_STATUS_MIN_INTERVAL_MS: u64 = 500;
 #[cfg(test)]
@@ -33,16 +34,18 @@ static LAST_LOGGED_PCSC_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new()
 #[tokio::main]
 async fn main() -> Result<()> {
     init_logging();
-    remove_stale_socket().await?;
+    let socket_path = daemon_socket_path();
+    ensure_socket_parent_dir(&socket_path).await?;
+    remove_stale_socket(&socket_path).await?;
     let card_subsystem: Arc<dyn CardSubsystem> = Arc::new(PcscSubsystem);
     let auth_executor = Arc::new(AuthExecutor::from_env());
     let session_manager = Arc::new(SessionManager::new(StdDuration::from_secs(
         SESSION_TTL_SECONDS,
     )));
 
-    let listener = UnixListener::bind(SOCKET_PATH)
-        .with_context(|| format!("failed to bind unix socket at {SOCKET_PATH}"))?;
-    info!(socket = SOCKET_PATH, "daemon started");
+    let listener = UnixListener::bind(&socket_path)
+        .with_context(|| format!("failed to bind unix socket at {}", socket_path.display()))?;
+    info!(socket = %socket_path.display(), "daemon started");
 
     loop {
         let (stream, _) = listener.accept().await.context("accept failed")?;
@@ -67,12 +70,55 @@ fn init_logging() {
         .init();
 }
 
-async fn remove_stale_socket() -> Result<()> {
-    match tokio::fs::remove_file(SOCKET_PATH).await {
+async fn remove_stale_socket(path: &Path) -> Result<()> {
+    match tokio::fs::remove_file(path).await {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err).context("failed to remove stale socket"),
     }
+}
+
+fn daemon_socket_path() -> PathBuf {
+    if let Ok(path) = std::env::var("OPENAUSWEIS_DAEMON_SOCKET") {
+        if !path.trim().is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+
+    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        if !runtime_dir.trim().is_empty() {
+            return PathBuf::from(runtime_dir)
+                .join("openausweis")
+                .join("daemon.sock");
+        }
+    }
+
+    PathBuf::from(SOCKET_PATH_FALLBACK)
+}
+
+async fn ensure_socket_parent_dir(socket_path: &Path) -> Result<()> {
+    let Some(parent) = socket_path.parent() else {
+        return Ok(());
+    };
+
+    tokio::fs::create_dir_all(parent)
+        .await
+        .with_context(|| format!("failed to create daemon socket parent at {}", parent.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to lock down daemon socket parent permissions at {}",
+                    parent.display()
+                )
+            })?;
+    }
+
+    Ok(())
 }
 
 async fn handle_connection(
@@ -193,6 +239,7 @@ async fn stream_session_updates(
                 session_id: snapshot.session_id,
                 state: snapshot.state,
                 error: snapshot.error.clone(),
+                handoff_id: snapshot.handoff_id.clone(),
             },
         );
 
@@ -223,6 +270,7 @@ async fn stream_session_updates(
                             session_id: current.session_id,
                             state: current.state,
                             error: current.error.clone(),
+                            handoff_id: current.handoff_id.clone(),
                         },
                     );
                     if let Err(err) = write_envelope(writer, &envelope).await {
@@ -306,11 +354,15 @@ async fn route_request(
             code: "INVALID_REQUEST".to_string(),
             message: "WatchSessions must be handled by streaming connection path".to_string(),
         },
-        ClientRequest::StartSession { relying_party } => {
-            match session_manager.start_session(relying_party) {
+        ClientRequest::StartSession {
+            relying_party,
+            handoff_id,
+        } => {
+            match session_manager.start_session(relying_party, handoff_id) {
                 Ok(session) => DaemonResponse::SessionStarted {
                     session_id: session.session_id,
                     state: session.state,
+                    handoff_id: session.handoff_id,
                 },
                 Err(err) => DaemonResponse::Error {
                     code: "SESSION_ALREADY_ACTIVE".to_string(),
@@ -327,6 +379,7 @@ async fn route_request(
                                 session_id: session.session_id,
                                 state: session.state,
                                 error: session.error,
+                                handoff_id: session.handoff_id,
                             },
                             None => DaemonResponse::Error {
                                 code: "SESSION_NOT_FOUND".to_string(),
@@ -340,6 +393,7 @@ async fn route_request(
                                     session_id: session.session_id,
                                     state: session.state,
                                     error: session.error,
+                                    handoff_id: session.handoff_id,
                                 },
                                 None => DaemonResponse::Error {
                                     code: "SESSION_NOT_FOUND".to_string(),
@@ -592,6 +646,7 @@ mod tests {
         let response = route_request(
             ClientRequest::StartSession {
                 relying_party: "https://localhost".to_string(),
+                handoff_id: Some("handoff-test-1".to_string()),
             },
             &subsystem,
             &executor,
@@ -600,13 +655,19 @@ mod tests {
         .await;
 
         match response {
-            DaemonResponse::SessionStarted { session_id, state } => {
+            DaemonResponse::SessionStarted {
+                session_id,
+                state,
+                handoff_id,
+            } => {
                 assert_eq!(state, SessionState::PinEntry);
+                assert_eq!(handoff_id.as_deref(), Some("handoff-test-1"));
                 assert_eq!(sessions.active_count(), 1);
                 let snapshot = sessions
                     .current_session()
                     .expect("current session should exist");
                 assert_eq!(snapshot.session_id, session_id);
+                assert_eq!(snapshot.handoff_id.as_deref(), Some("handoff-test-1"));
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -621,6 +682,7 @@ mod tests {
         let started = route_request(
             ClientRequest::StartSession {
                 relying_party: "https://localhost".to_string(),
+                handoff_id: Some("handoff-test-2".to_string()),
             },
             &subsystem,
             &executor,
@@ -649,10 +711,12 @@ mod tests {
                 session_id: returned,
                 state,
                 error,
+                handoff_id,
             } => {
                 assert_eq!(returned, session_id);
                 assert_eq!(state, SessionState::Completed);
                 assert!(error.is_none());
+                assert_eq!(handoff_id.as_deref(), Some("handoff-test-2"));
             }
             other => panic!("unexpected submit response: {other:?}"),
         }
@@ -667,6 +731,7 @@ mod tests {
         let started = route_request(
             ClientRequest::StartSession {
                 relying_party: "https://localhost".to_string(),
+                handoff_id: Some("handoff-test-3".to_string()),
             },
             &subsystem,
             &executor,
@@ -695,10 +760,12 @@ mod tests {
                 session_id: returned,
                 state,
                 error,
+                handoff_id,
             } => {
                 assert_eq!(returned, session_id);
                 assert_eq!(state, SessionState::Error);
                 assert_eq!(error.as_deref(), Some("forced executor failure"));
+                assert_eq!(handoff_id.as_deref(), Some("handoff-test-3"));
             }
             other => panic!("unexpected submit response: {other:?}"),
         }
@@ -721,7 +788,10 @@ mod tests {
         });
 
         let snapshot = sessions_for_updates
-            .start_session("https://localhost".to_string())
+            .start_session(
+                "https://localhost".to_string(),
+                Some("handoff-stream-1".to_string()),
+            )
             .expect("start session should succeed");
 
         let (reader_half, _reader_writer) = reader_stream.into_split();
@@ -737,10 +807,14 @@ mod tests {
             serde_json::from_str(&first).expect("parse first envelope failed");
         match first_env.payload {
             DaemonResponse::SessionUpdated {
-                session_id, state, ..
+                session_id,
+                state,
+                handoff_id,
+                ..
             } => {
                 assert_eq!(session_id, snapshot.session_id);
                 assert_eq!(state, SessionState::PinEntry);
+                assert_eq!(handoff_id.as_deref(), Some("handoff-stream-1"));
             }
             other => panic!("unexpected first payload: {other:?}"),
         }
@@ -782,7 +856,10 @@ mod tests {
         });
 
         let snapshot = sessions_for_updates
-            .start_session("https://localhost".to_string())
+            .start_session(
+                "https://localhost".to_string(),
+                Some("handoff-stream-2".to_string()),
+            )
             .expect("start session should succeed");
 
         let (reader_half, _reader_writer) = reader_stream.into_split();
@@ -798,10 +875,14 @@ mod tests {
             serde_json::from_str(&first).expect("parse first envelope failed");
         match first_env.payload {
             DaemonResponse::SessionUpdated {
-                session_id, state, ..
+                session_id,
+                state,
+                handoff_id,
+                ..
             } => {
                 assert_eq!(session_id, snapshot.session_id);
                 assert_eq!(state, SessionState::PinEntry);
+                assert_eq!(handoff_id.as_deref(), Some("handoff-stream-2"));
             }
             other => panic!("unexpected first payload: {other:?}"),
         }
@@ -823,10 +904,12 @@ mod tests {
                 session_id,
                 state,
                 error,
+                handoff_id,
             } => {
                 assert_eq!(session_id, snapshot.session_id);
                 assert_eq!(state, SessionState::Error);
                 assert_eq!(error.as_deref(), Some("streamed failure"));
+                assert_eq!(handoff_id.as_deref(), Some("handoff-stream-2"));
             }
             other => panic!("unexpected second payload: {other:?}"),
         }

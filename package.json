@@ -12,6 +12,11 @@
     "build": "npm run --workspaces --if-present build",
     "dev": "npm run --workspace @openausweis/desktop dev",
     "dev:aa2": "./scripts/run-desktop-ausweisapp2.sh",
+    "install-native-host": "./scripts/install-native-host.sh",
+    "install-native-host:firefox": "./scripts/install-native-host-firefox.sh",
+    "setup-native-host": "./scripts/setup-native-host.sh",
+    "validate:linux-packaging": "./scripts/validate-linux-packaging.sh",
+    "validate:linux-packaging:expected": "./scripts/validate-linux-packaging.sh --expect-chromium-id \"$OPENAUSWEIS_EXPECTED_CHROMIUM_EXTENSION_ID\" --expect-firefox-id \"$OPENAUSWEIS_EXPECTED_FIREFOX_ADDON_ID\"",
     "lint": "npm run --workspaces --if-present lint",
     "typecheck": "npm run --workspaces --if-present typecheck"
   }

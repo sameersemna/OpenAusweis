@@ -5,6 +5,10 @@
  *   readers: { name: string, cardPresent: boolean, error?: string | null }[],
  *   diagnostics: string[], lastError?: string | null }} DaemonStatus
  * @typedef {{ type: string, data?: unknown }} DaemonPayload
+ * @typedef {{ nativeDisconnects: number, nativeTimeouts: number, watchRetries: number,
+ *   daemonErrors: number, sessionStarts: number, sessionCompletions: number,
+ *   sessionGuardRejects: number, waitAborts: number, lastError?: string | null,
+ *   updatedAt?: string | null }} BridgeDiagnostics
  */
 
 /** @returns {Promise<DaemonStatus | null>} */
@@ -20,6 +24,20 @@ async function fetchStatus() {
       return null;
     }
     return /** @type {DaemonStatus} */ (payload.data);
+  } catch (_) {
+    return null;
+  }
+}
+
+/** @returns {Promise<BridgeDiagnostics | null>} */
+async function fetchBridgeDiagnostics() {
+  try {
+    const result = await chrome.runtime.sendMessage({ type: "GET_BRIDGE_DIAGNOSTICS" });
+    if (!result?.ok || !result?.diagnostics) {
+      return null;
+    }
+
+    return /** @type {BridgeDiagnostics} */ (result.diagnostics);
   } catch (_) {
     return null;
   }
@@ -110,12 +128,43 @@ function renderDisconnected() {
   body.append(note);
 }
 
+/** @param {BridgeDiagnostics} diagnostics */
+function renderBridgeDiagnostics(diagnostics) {
+  const body = /** @type {HTMLElement} */ (document.getElementById("body"));
+  const section = document.createElement("div");
+  section.className = "readers-section";
+
+  const sectionLabel = document.createElement("div");
+  sectionLabel.className = "label";
+  sectionLabel.textContent = "Bridge Diagnostics";
+  section.append(sectionLabel);
+
+  section.append(makeRow("Session starts", "ok", String(diagnostics.sessionStarts)));
+  section.append(makeRow("Completions", "ok", String(diagnostics.sessionCompletions)));
+  section.append(makeRow("Watch retries", "warn", String(diagnostics.watchRetries)));
+  section.append(makeRow("Native timeouts", "warn", String(diagnostics.nativeTimeouts)));
+  section.append(makeRow("Native disconnects", "warn", String(diagnostics.nativeDisconnects)));
+
+  if (diagnostics.lastError) {
+    const errNote = document.createElement("div");
+    errNote.className = "error-note";
+    errNote.textContent = diagnostics.lastError;
+    section.append(errNote);
+  }
+
+  body.append(section);
+}
+
 async function refresh() {
-  const status = await fetchStatus();
+  const [status, diagnostics] = await Promise.all([fetchStatus(), fetchBridgeDiagnostics()]);
   if (status) {
     renderStatus(status);
   } else {
     renderDisconnected();
+  }
+
+  if (diagnostics) {
+    renderBridgeDiagnostics(diagnostics);
   }
 }
 

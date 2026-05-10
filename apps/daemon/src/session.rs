@@ -9,6 +9,7 @@ pub struct SessionSnapshot {
     pub session_id: Uuid,
     pub state: SessionState,
     pub error: Option<String>,
+    pub handoff_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -51,6 +52,7 @@ impl std::error::Error for SubmitPinError {}
 #[derive(Debug)]
 struct SessionEntry {
     _relying_party: String,
+    handoff_id: Option<String>,
     state: SessionState,
     pin_attempts: u8,
     last_error: Option<String>,
@@ -83,7 +85,11 @@ impl SessionManager {
         guard.len() as u32
     }
 
-    pub fn start_session(&self, relying_party: String) -> Result<SessionSnapshot, StartSessionError> {
+    pub fn start_session(
+        &self,
+        relying_party: String,
+        handoff_id: Option<String>,
+    ) -> Result<SessionSnapshot, StartSessionError> {
         self.prune_expired();
 
         let mut guard = self.sessions.lock().expect("session lock poisoned");
@@ -99,6 +105,7 @@ impl SessionManager {
             session_id,
             SessionEntry {
                 _relying_party: relying_party,
+                handoff_id: handoff_id.clone(),
                 state,
                 pin_attempts: 0,
                 last_error: None,
@@ -110,6 +117,7 @@ impl SessionManager {
             session_id,
             state,
             error: None,
+            handoff_id,
         })
     }
 
@@ -126,6 +134,7 @@ impl SessionManager {
             session_id: *session_id,
             state: entry.state,
             error: entry.last_error.clone(),
+            handoff_id: entry.handoff_id.clone(),
         })
     }
 
@@ -161,6 +170,7 @@ impl SessionManager {
             session_id,
             state: entry.state,
             error: None,
+            handoff_id: entry.handoff_id.clone(),
         })
     }
 
@@ -175,6 +185,7 @@ impl SessionManager {
             session_id,
             state: SessionState::Completed,
             error: None,
+            handoff_id: entry.handoff_id.clone(),
         })
     }
 
@@ -190,6 +201,7 @@ impl SessionManager {
             session_id,
             state: SessionState::Error,
             error: Some(message),
+            handoff_id: entry.handoff_id.clone(),
         })
     }
 
@@ -207,10 +219,10 @@ mod tests {
     fn start_session_enforces_single_active_session() {
         let manager = SessionManager::new(Duration::from_secs(60));
         let first = manager
-            .start_session("https://example.org".to_string())
+            .start_session("https://example.org".to_string(), Some("handoff-a".to_string()))
             .expect("first start should succeed");
 
-        let second = manager.start_session("https://second.example.org".to_string());
+        let second = manager.start_session("https://second.example.org".to_string(), None);
         assert!(matches!(
             second,
             Err(StartSessionError::SessionAlreadyActive)
@@ -219,16 +231,17 @@ mod tests {
         assert!(manager.cancel_session(first.session_id));
 
         let third = manager
-            .start_session("https://third.example.org".to_string())
+            .start_session("https://third.example.org".to_string(), None)
             .expect("start after cancel should succeed");
         assert_eq!(third.state, SessionState::PinEntry);
+        assert!(third.handoff_id.is_none());
     }
 
     #[test]
     fn submit_pin_enforces_format_and_completes_session() {
         let manager = SessionManager::new(Duration::from_secs(60));
         let session = manager
-            .start_session("https://example.org".to_string())
+            .start_session("https://example.org".to_string(), Some("handoff-b".to_string()))
             .expect("start should succeed");
 
         let invalid = manager
@@ -246,19 +259,21 @@ mod tests {
             .expect("valid PIN should complete placeholder flow");
         assert_eq!(card_interaction.state, SessionState::CardInteraction);
         assert!(card_interaction.error.is_none());
+        assert_eq!(card_interaction.handoff_id.as_deref(), Some("handoff-b"));
 
         let completed = manager
             .complete_session(session.session_id)
             .expect("session should exist for completion");
         assert_eq!(completed.state, SessionState::Completed);
         assert!(completed.error.is_none());
+        assert_eq!(completed.handoff_id.as_deref(), Some("handoff-b"));
     }
 
     #[test]
     fn fail_session_sets_error_state() {
         let manager = SessionManager::new(Duration::from_secs(60));
         let session = manager
-            .start_session("https://example.org".to_string())
+            .start_session("https://example.org".to_string(), Some("handoff-c".to_string()))
             .expect("start should succeed");
 
         let failed = manager
@@ -266,5 +281,6 @@ mod tests {
             .expect("session should exist");
         assert_eq!(failed.state, SessionState::Error);
         assert_eq!(failed.error.as_deref(), Some("executor failed"));
+        assert_eq!(failed.handoff_id.as_deref(), Some("handoff-c"));
     }
 }

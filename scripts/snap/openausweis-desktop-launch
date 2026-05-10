@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Placeholder snap launch shim. Replace with packaged desktop binary invocation.
+exec "$SNAP/usr/bin/openausweis-desktop" "$@"

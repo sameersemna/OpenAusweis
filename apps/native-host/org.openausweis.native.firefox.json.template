@@ -1,0 +1,9 @@
+{
+  "name": "org.openausweis.native",
+  "description": "OpenAusweis native messaging bridge - connects the Firefox add-on to the local daemon.",
+  "path": "__NATIVE_HOST_BINARY_PATH__",
+  "type": "stdio",
+  "allowed_extensions": [
+    "__FIREFOX_ADDON_ID__"
+  ]
+}

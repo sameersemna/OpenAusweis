@@ -14,15 +14,15 @@ use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use tauri::menu::{Menu, MenuItem};
-use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Emitter};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::Command;
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
-const DAEMON_SOCKET_PATH: &str = "/tmp/openausweis-daemon.sock";
+const DAEMON_SOCKET_PATH_FALLBACK: &str = "/tmp/openausweis-daemon.sock";
 const DAEMON_STATUS_EVENT: &str = "daemon-status";
 const DAEMON_SESSION_EVENT: &str = "daemon-session";
 const DAEMON_STATUS_STREAM_INTERVAL_MS: u64 = 1000;
@@ -33,6 +33,11 @@ const DAEMON_AUTOSTART_RETRY_DELAY_MS: u64 = 500;
 const DAEMON_AUTOSTART_COOLDOWN_MS: u64 = 3000;
 const DEFAULT_ALLOWED_EXACT_ORIGINS: &[&str] = &["http://localhost", "https://localhost"];
 const DEFAULT_ALLOWED_SUFFIXES: &[&str] = &[".bundid.de", ".bund.de"];
+const MAIN_WINDOW_LABEL: &str = "main";
+const TRAY_ACTION_TOGGLE: &str = "toggle-window";
+const TRAY_ACTION_SHOW: &str = "show-window";
+const TRAY_ACTION_HIDE: &str = "hide-window";
+const TRAY_ACTION_QUIT: &str = "quit";
 
 #[derive(Debug)]
 struct DaemonStartState {
@@ -85,12 +90,17 @@ async fn probe_daemon_status() -> std::result::Result<DesktopDaemonStatus, Strin
 async fn start_test_session() -> std::result::Result<DesktopSessionUpdate, String> {
     let response = send_unary_daemon_request(ClientRequest::StartSession {
         relying_party: "https://localhost".to_string(),
+        handoff_id: Some("desktop-test-session".to_string()),
     })
     .await
     .map_err(|err| format!("{err}"))?;
 
     match response {
-        DaemonResponse::SessionStarted { session_id, state } => Ok(DesktopSessionUpdate {
+        DaemonResponse::SessionStarted {
+            session_id,
+            state,
+            ..
+        } => Ok(DesktopSessionUpdate {
             connected: true,
             session_id: Some(session_id.to_string()),
             state: Some(session_state_wire_value(state).to_string()),
@@ -128,6 +138,7 @@ async fn submit_session_pin(session_id: String, pin: String) -> std::result::Res
             session_id,
             state,
             error,
+            ..
         } => Ok(DesktopSessionUpdate {
             connected: true,
             session_id: Some(session_id.to_string()),
@@ -441,9 +452,28 @@ async fn connect_to_daemon_with_autostart() -> Result<UnixStream> {
 }
 
 async fn connect_to_daemon_socket() -> Result<UnixStream> {
-    UnixStream::connect(DAEMON_SOCKET_PATH)
+    let socket_path = daemon_socket_path();
+    UnixStream::connect(&socket_path)
         .await
-        .with_context(|| format!("failed to connect to daemon socket at {DAEMON_SOCKET_PATH}"))
+        .with_context(|| format!("failed to connect to daemon socket at {}", socket_path.display()))
+}
+
+fn daemon_socket_path() -> PathBuf {
+    if let Ok(path) = std::env::var("OPENAUSWEIS_DAEMON_SOCKET") {
+        if !path.trim().is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+
+    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        if !runtime_dir.trim().is_empty() {
+            return PathBuf::from(runtime_dir)
+                .join("openausweis")
+                .join("daemon.sock");
+        }
+    }
+
+    PathBuf::from(DAEMON_SOCKET_PATH_FALLBACK)
 }
 
 fn is_socket_bootstrap_error(err: &anyhow::Error) -> bool {
@@ -793,6 +823,7 @@ fn parse_session_stream_response_line(
             session_id,
             state,
             error,
+            ..
         } => Ok(DesktopSessionUpdate {
             connected: true,
             session_id: Some(session_id.to_string()),
@@ -857,17 +888,71 @@ fn validate_response_metadata(
     Ok(())
 }
 
+fn with_main_window(app: &AppHandle) -> Option<WebviewWindow> {
+    app.get_webview_window(MAIN_WINDOW_LABEL)
+}
+
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = with_main_window(app) {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+fn hide_main_window(app: &AppHandle) {
+    if let Some(window) = with_main_window(app) {
+        let _ = window.hide();
+    }
+}
+
+fn toggle_main_window(app: &AppHandle) {
+    if let Some(window) = with_main_window(app) {
+        match window.is_visible() {
+            Ok(true) => {
+                let _ = window.hide();
+            }
+            Ok(false) => {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+            Err(_) => {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }
+    }
+}
+
 fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
-    let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let tray_menu = Menu::with_items(app, &[&quit_item])?;
-    let quit_id = quit_item.id().clone();
+    let toggle_item = MenuItem::with_id(app, TRAY_ACTION_TOGGLE, "Show/Hide OpenAusweis", true, None::<&str>)?;
+    let show_item = MenuItem::with_id(app, TRAY_ACTION_SHOW, "Show Window", true, None::<&str>)?;
+    let hide_item = MenuItem::with_id(app, TRAY_ACTION_HIDE, "Hide Window", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, TRAY_ACTION_QUIT, "Quit", true, None::<&str>)?;
+    let tray_menu = Menu::with_items(app, &[&toggle_item, &show_item, &hide_item, &quit_item])?;
 
     TrayIconBuilder::with_id("main")
         .menu(&tray_menu)
         .show_menu_on_left_click(false)
         .on_menu_event(move |app_handle, event| {
-            if event.id() == &quit_id {
-                app_handle.exit(0);
+            match event.id().as_ref() {
+                TRAY_ACTION_TOGGLE => toggle_main_window(app_handle),
+                TRAY_ACTION_SHOW => show_main_window(app_handle),
+                TRAY_ACTION_HIDE => hide_main_window(app_handle),
+                TRAY_ACTION_QUIT => app_handle.exit(0),
+                _ => {}
+            }
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                toggle_main_window(tray.app_handle());
             }
         })
         .build(app)?;
@@ -877,6 +962,12 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
 
 fn main() {
     tauri::Builder::default()
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .setup(|app| {
             setup_tray(app)?;
             spawn_daemon_status_stream(app.handle().clone());

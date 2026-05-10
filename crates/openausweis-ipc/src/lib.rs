@@ -31,7 +31,10 @@ pub enum ClientRequest {
     GetStatus,
     WatchStatus { interval_ms: u64 },
     WatchSessions { interval_ms: u64 },
-    StartSession { relying_party: String },
+    StartSession {
+        relying_party: String,
+        handoff_id: Option<String>,
+    },
     SubmitPin { session_id: Uuid, pin: String },
     CancelSession { session_id: Uuid },
 }
@@ -43,11 +46,13 @@ pub enum DaemonResponse {
     SessionStarted {
         session_id: Uuid,
         state: SessionState,
+        handoff_id: Option<String>,
     },
     SessionUpdated {
         session_id: Uuid,
         state: SessionState,
         error: Option<String>,
+        handoff_id: Option<String>,
     },
     SessionCancelled { session_id: Uuid },
     Error { code: String, message: String },
