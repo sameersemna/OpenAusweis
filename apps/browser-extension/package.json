@@ -6,12 +6,14 @@
   "scripts": {
     "build": "tsc --noEmit",
     "lint": "echo \"No linter configured yet\"",
+    "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@openausweis/shared-types": "0.1.0"
   },
   "devDependencies": {
-    "typescript": "^5.8.3"
+    "typescript": "^5.8.3",
+    "vitest": "^4.1.5"
   }
 }

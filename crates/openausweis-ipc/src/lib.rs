@@ -77,6 +77,16 @@ pub struct DaemonStatus {
     pub readers: Vec<ReaderStatus>,
     pub diagnostics: Vec<String>,
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub ipc_diagnostics: IpcDiagnostics,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcDiagnostics {
+    pub request_count: u64,
+    pub error_count: u64,
+    pub validation_rejections: u64,
+    pub connection_failures: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

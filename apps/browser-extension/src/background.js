@@ -8,6 +8,9 @@ const WATCH_SESSIONS_INTERVAL_MS = 500;
 const WATCH_RETRY_DELAY_MS = 200;
 const WATCH_IDLE_DELAY_MS = 120;
 const SESSION_COMPLETION_TIMEOUT_MS = 120000;
+const SESSION_COMPLETION_TIMEOUT_MIN_MS = 5000;
+const SESSION_COMPLETION_TIMEOUT_MAX_MS = 180000;
+const MAX_ACTIVE_SESSION_WAITS = 32;
 
 const activeSessionWaits = new Map();
 const bridgeMetrics = {
@@ -42,6 +45,18 @@ function createAbortError(message) {
   const error = new Error(message);
   error.name = "AbortError";
   return error;
+}
+
+function clampSessionWaitTimeout(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return SESSION_COMPLETION_TIMEOUT_MS;
+  }
+
+  return Math.max(
+    SESSION_COMPLETION_TIMEOUT_MIN_MS,
+    Math.min(SESSION_COMPLETION_TIMEOUT_MAX_MS, Math.floor(parsed))
+  );
 }
 
 function recordMetric(key, value = null) {
@@ -412,10 +427,12 @@ function parseDaemonPayloadError(payload) {
 }
 
 async function waitForSessionCompletion(sessionId, options = {}) {
-  const timeoutMs = Number.isFinite(options.timeoutMs)
-    ? Number(options.timeoutMs)
-    : SESSION_COMPLETION_TIMEOUT_MS;
+  const timeoutMs = clampSessionWaitTimeout(options.timeoutMs);
   const abortSignal = options.abortSignal;
+  const expectedHandoffId =
+    typeof options.expectedHandoffId === "string" && options.expectedHandoffId.length > 0
+      ? options.expectedHandoffId
+      : null;
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
@@ -433,6 +450,15 @@ async function waitForSessionCompletion(sessionId, options = {}) {
         const updateSessionId = payload?.data?.session_id;
         if (updateSessionId !== sessionId) {
           continue;
+        }
+
+        if (expectedHandoffId !== null) {
+          const updateHandoffId = payload?.data?.handoff_id;
+          if (typeof updateHandoffId === "string" && updateHandoffId !== expectedHandoffId) {
+            throw new Error(
+              `Session handoff mismatch: expected ${expectedHandoffId}, got ${updateHandoffId}`
+            );
+          }
         }
 
         const state = payload?.data?.state;
@@ -476,6 +502,18 @@ async function waitForSessionCompletion(sessionId, options = {}) {
   throw new Error("Session timed out while waiting for completion");
 }
 
+// Named exports for unit testing — pure/stateless functions only.
+// background.js is declared as `"type": "module"` in the manifest so these
+// exports are harmless at runtime and fully tree-shakeable by any bundler.
+export {
+  clampSessionWaitTimeout,
+  parseOrigin,
+  isAllowedOrigin,
+  buildPayload,
+  isRetryableWatchError,
+  sessionWaitKey,
+};
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
     if (message?.type === "GET_BRIDGE_DIAGNOSTICS") {
@@ -504,6 +542,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         throw new Error("A session is already in progress for this browser context");
       }
 
+      if (activeSessionWaits.size >= MAX_ACTIVE_SESSION_WAITS) {
+        recordMetric("sessionGuardRejects");
+        throw new Error("Too many concurrent OpenAusweis session waits");
+      }
+
       const waitState = {
         abortController: new AbortController(),
         sessionId: null,
@@ -525,8 +568,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
 
         const sessionId = response?.data?.session_id;
+        const responseHandoffId = response?.data?.handoff_id;
         if (typeof sessionId !== "string" || sessionId.length === 0) {
           throw new Error("SESSION_STARTED did not provide a session_id");
+        }
+
+        if (
+          typeof responseHandoffId === "string" &&
+          responseHandoffId.length > 0 &&
+          responseHandoffId !== startMessage.handoff_id
+        ) {
+          throw new Error(
+            `SESSION_STARTED handoff mismatch: expected ${startMessage.handoff_id}, got ${responseHandoffId}`
+          );
         }
 
         waitState.sessionId = sessionId;
@@ -534,6 +588,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const completionResponse = await waitForSessionCompletion(sessionId, {
           timeoutMs: SESSION_COMPLETION_TIMEOUT_MS,
           abortSignal: waitState.abortController.signal,
+          expectedHandoffId: startMessage.handoff_id,
         });
 
         sendResponse({

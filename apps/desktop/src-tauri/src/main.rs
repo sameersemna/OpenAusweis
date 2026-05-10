@@ -18,7 +18,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
@@ -31,6 +31,8 @@ const DAEMON_STATUS_RECONNECT_DELAY_MS: u64 = 1500;
 const DAEMON_SESSION_RECONNECT_DELAY_MS: u64 = 1500;
 const DAEMON_AUTOSTART_RETRY_DELAY_MS: u64 = 500;
 const DAEMON_AUTOSTART_COOLDOWN_MS: u64 = 3000;
+const DAEMON_AUTOSTART_WAIT_TIMEOUT_MS: u64 = 4000;
+const DAEMON_AUTOSTART_WAIT_POLL_MS: u64 = 125;
 const DEFAULT_ALLOWED_EXACT_ORIGINS: &[&str] = &["http://localhost", "https://localhost"];
 const DEFAULT_ALLOWED_SUFFIXES: &[&str] = &[".bundid.de", ".bund.de"];
 const MAIN_WINDOW_LABEL: &str = "main";
@@ -46,6 +48,71 @@ struct DaemonStartState {
 
 static DAEMON_START_STATE: OnceLock<Mutex<DaemonStartState>> = OnceLock::new();
 
+/// Coarse health state tracked to avoid redundant tray tooltip updates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TrayHealthState {
+    Unknown,
+    /// Daemon healthy and PC/SC available.
+    Healthy { active_sessions: u32 },
+    /// Daemon healthy but no PC/SC readers detected.
+    Degraded { active_sessions: u32 },
+    /// Daemon stream disconnected or status indicates unhealthy.
+    Disconnected,
+}
+
+static LAST_TRAY_STATE: OnceLock<Mutex<TrayHealthState>> = OnceLock::new();
+
+fn tray_tooltip_for_state(state: &TrayHealthState) -> String {
+    match state {
+        TrayHealthState::Unknown => "OpenAusweis".to_string(),
+        TrayHealthState::Healthy {
+            active_sessions: 0,
+        } => "OpenAusweis\nDaemon: ready".to_string(),
+        TrayHealthState::Healthy { active_sessions } => {
+            format!("OpenAusweis\nSession active ({active_sessions})")
+        }
+        TrayHealthState::Degraded {
+            active_sessions: 0,
+        } => "OpenAusweis\nDaemon: running (no card reader)".to_string(),
+        TrayHealthState::Degraded { active_sessions } => {
+            format!("OpenAusweis\nSession active ({active_sessions}) — no card reader")
+        }
+        TrayHealthState::Disconnected => "OpenAusweis\nDaemon: disconnected".to_string(),
+    }
+}
+
+fn tray_health_from_status(status: &DesktopDaemonStatus) -> TrayHealthState {
+    if !status.healthy {
+        return TrayHealthState::Disconnected;
+    }
+    if status.pcsc_available {
+        TrayHealthState::Healthy {
+            active_sessions: status.active_session_count,
+        }
+    } else {
+        TrayHealthState::Degraded {
+            active_sessions: status.active_session_count,
+        }
+    }
+}
+
+/// Updates the tray tooltip only when the health state has changed.
+/// No-op if the tray icon is unavailable (e.g. tray not yet set up).
+fn update_tray_tooltip(app: &AppHandle, new_state: TrayHealthState) {
+    let lock = LAST_TRAY_STATE.get_or_init(|| Mutex::new(TrayHealthState::Unknown));
+    let mut last = lock.lock().expect("tray state lock poisoned");
+    if *last == new_state {
+        return;
+    }
+    *last = new_state.clone();
+    drop(last);
+
+    let tooltip = tray_tooltip_for_state(&new_state);
+    if let Some(tray) = app.tray_by_id("main") {
+        let _ = tray.set_tooltip(Some(tooltip.as_str()));
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopDaemonStatus {
@@ -55,6 +122,16 @@ struct DesktopDaemonStatus {
     readers: Vec<DesktopReaderStatus>,
     diagnostics: Vec<String>,
     last_error: Option<String>,
+    ipc_diagnostics: Option<DesktopIpcDiagnostics>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopIpcDiagnostics {
+    request_count: u64,
+    error_count: u64,
+    validation_rejections: u64,
+    connection_failures: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -72,6 +149,15 @@ struct DesktopSessionUpdate {
     session_id: Option<String>,
     state: Option<String>,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopRuntimeContext {
+    desktop_env: Option<String>,
+    session_type: Option<String>,
+    tray_strategy: String,
+    notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,6 +266,43 @@ async fn save_origin_policy(policy: OriginPolicyPayload) -> std::result::Result<
     write_origin_policy(&policy)
         .await
         .map_err(|err| format!("{err}"))
+}
+
+#[tauri::command]
+async fn get_runtime_context() -> std::result::Result<DesktopRuntimeContext, String> {
+    Ok(detect_runtime_context())
+}
+
+fn detect_runtime_context() -> DesktopRuntimeContext {
+    let desktop_env = std::env::var("XDG_CURRENT_DESKTOP")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let session_type = std::env::var("XDG_SESSION_TYPE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    let mut notes = Vec::new();
+    if session_type.as_deref() == Some("wayland") {
+        notes.push("Wayland session detected; tray visibility depends on desktop shell integration.".to_string());
+    }
+
+    if desktop_env
+        .as_deref()
+        .map(|value| value.contains("GNOME"))
+        .unwrap_or(false)
+        && session_type.as_deref() == Some("wayland")
+    {
+        notes.push("GNOME Wayland may require AppIndicator support for persistent tray visibility.".to_string());
+    }
+
+    DesktopRuntimeContext {
+        desktop_env,
+        session_type,
+        tray_strategy: "tray-icon-with-window-fallback".to_string(),
+        notes,
+    }
 }
 
 fn default_origin_policy() -> OriginPolicyPayload {
@@ -480,14 +603,16 @@ fn is_socket_bootstrap_error(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         cause
             .downcast_ref::<std::io::Error>()
-            .map(|io_err| {
-                matches!(
-                    io_err.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-                )
-            })
+            .map(is_socket_bootstrap_io_error)
             .unwrap_or(false)
     })
+}
+
+fn is_socket_bootstrap_io_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+    )
 }
 
 async fn maybe_autostart_daemon() -> Result<()> {
@@ -509,7 +634,20 @@ async fn maybe_autostart_daemon() -> Result<()> {
         }
 
         match command.spawn() {
-            Ok(_) => return Ok(()),
+            Ok(mut child) => {
+                match wait_for_daemon_ready(&mut child).await {
+                    Ok(()) => return Ok(()),
+                    Err(err) => {
+                        let _ = child.start_kill();
+                        launch_errors.push(format!(
+                            "{} {:?}: {}",
+                            launch.command,
+                            launch.args,
+                            err
+                        ));
+                    }
+                }
+            }
             Err(err) => {
                 launch_errors.push(format!(
                     "{} {:?}: {}",
@@ -525,6 +663,50 @@ async fn maybe_autostart_daemon() -> Result<()> {
         "failed to autostart daemon; launch attempts: {}",
         launch_errors.join(" | ")
     ))
+}
+
+async fn wait_for_daemon_ready(child: &mut Child) -> Result<()> {
+    let socket_path = daemon_socket_path();
+    let timeout = Duration::from_millis(DAEMON_AUTOSTART_WAIT_TIMEOUT_MS);
+    let poll_interval = Duration::from_millis(DAEMON_AUTOSTART_WAIT_POLL_MS);
+    let started = Instant::now();
+
+    loop {
+        match UnixStream::connect(&socket_path).await {
+            Ok(stream) => {
+                drop(stream);
+                return Ok(());
+            }
+            Err(err) => {
+                if !is_socket_bootstrap_io_error(&err) {
+                    return Err(anyhow::anyhow!(
+                        "daemon socket became unavailable with non-retryable error at {}: {}",
+                        socket_path.display(),
+                        err
+                    ));
+                }
+            }
+        }
+
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to poll daemon autostart process status")?
+        {
+            return Err(anyhow::anyhow!(
+                "daemon process exited before socket became ready: {status}"
+            ));
+        }
+
+        if started.elapsed() >= timeout {
+            return Err(anyhow::anyhow!(
+                "timed out waiting {}ms for daemon socket at {}",
+                DAEMON_AUTOSTART_WAIT_TIMEOUT_MS,
+                socket_path.display()
+            ));
+        }
+
+        sleep(poll_interval).await;
+    }
 }
 
 fn record_autostart_attempt() -> bool {
@@ -639,6 +821,7 @@ async fn send_unary_daemon_request(request_payload: ClientRequest) -> Result<Dae
 }
 
 fn to_desktop_status(status: openausweis_ipc::DaemonStatus) -> DesktopDaemonStatus {
+    let ipc = status.ipc_diagnostics;
     DesktopDaemonStatus {
         healthy: status.healthy,
         pcsc_available: status.pcsc_available,
@@ -654,6 +837,12 @@ fn to_desktop_status(status: openausweis_ipc::DaemonStatus) -> DesktopDaemonStat
             .collect(),
         diagnostics: status.diagnostics,
         last_error: status.last_error,
+        ipc_diagnostics: Some(DesktopIpcDiagnostics {
+            request_count: ipc.request_count,
+            error_count: ipc.error_count,
+            validation_rejections: ipc.validation_rejections,
+            connection_failures: ipc.connection_failures,
+        }),
     }
 }
 
@@ -665,6 +854,7 @@ fn disconnected_status(details: String) -> DesktopDaemonStatus {
         readers: Vec::new(),
         diagnostics: vec![details],
         last_error: Some("daemon stream disconnected".to_string()),
+        ipc_diagnostics: None,
     }
 }
 
@@ -672,10 +862,9 @@ fn spawn_daemon_status_stream(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         loop {
             if let Err(err) = stream_daemon_status_once(&app).await {
-                let _ = app.emit(
-                    DAEMON_STATUS_EVENT,
-                    disconnected_status(format!("daemon status stream error: {err}")),
-                );
+                let ds = disconnected_status(format!("daemon status stream error: {err}"));
+                update_tray_tooltip(&app, TrayHealthState::Disconnected);
+                let _ = app.emit(DAEMON_STATUS_EVENT, ds);
                 sleep(reconnect_backoff_delay()).await;
             }
         }
@@ -734,6 +923,7 @@ async fn stream_daemon_status_once(app: &AppHandle) -> Result<()> {
         .context("failed to read daemon stream response")?
     {
         let status = parse_stream_response_line(request_id, &line)?;
+        update_tray_tooltip(app, tray_health_from_status(&status));
         app.emit(DAEMON_STATUS_EVENT, status)
             .context("failed to emit daemon status event")?;
     }
@@ -935,6 +1125,7 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
 
     TrayIconBuilder::with_id("main")
         .menu(&tray_menu)
+        .tooltip("OpenAusweis")
         .show_menu_on_left_click(false)
         .on_menu_event(move |app_handle, event| {
             match event.id().as_ref() {
@@ -980,7 +1171,8 @@ fn main() {
             submit_session_pin,
             cancel_session,
             get_origin_policy,
-            save_origin_policy
+            save_origin_policy,
+            get_runtime_context
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri app");
@@ -1164,5 +1356,128 @@ mod tests {
 
         let mut state = lock.lock().expect("daemon start state lock poisoned");
         state.last_attempt = None;
+    }
+
+    // ------------------------------------------------------------------
+    // TrayHealthState / tooltip tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn tray_tooltip_unknown_is_bare_product_name() {
+        assert_eq!(tray_tooltip_for_state(&TrayHealthState::Unknown), "OpenAusweis");
+    }
+
+    #[test]
+    fn tray_tooltip_healthy_no_sessions_shows_ready() {
+        let s = tray_tooltip_for_state(&TrayHealthState::Healthy { active_sessions: 0 });
+        assert!(s.contains("ready"), "expected 'ready' in: {s}");
+    }
+
+    #[test]
+    fn tray_tooltip_healthy_with_sessions_shows_count() {
+        let s = tray_tooltip_for_state(&TrayHealthState::Healthy { active_sessions: 2 });
+        assert!(s.contains("Session active"), "expected session info in: {s}");
+        assert!(s.contains("2"), "expected count in: {s}");
+    }
+
+    #[test]
+    fn tray_tooltip_degraded_no_sessions_mentions_card_reader() {
+        let s = tray_tooltip_for_state(&TrayHealthState::Degraded { active_sessions: 0 });
+        assert!(s.contains("no card reader"), "expected card reader note in: {s}");
+    }
+
+    #[test]
+    fn tray_tooltip_degraded_with_sessions_shows_both() {
+        let s = tray_tooltip_for_state(&TrayHealthState::Degraded { active_sessions: 1 });
+        assert!(s.contains("Session active"), "expected session info in: {s}");
+        assert!(s.contains("no card reader"), "expected card reader note in: {s}");
+    }
+
+    #[test]
+    fn tray_tooltip_disconnected_says_disconnected() {
+        let s = tray_tooltip_for_state(&TrayHealthState::Disconnected);
+        assert!(s.contains("disconnected"), "expected disconnected in: {s}");
+    }
+
+    #[test]
+    fn tray_health_from_status_unhealthy_is_disconnected() {
+        let status = DesktopDaemonStatus {
+            healthy: false,
+            pcsc_available: true,
+            active_session_count: 0,
+            readers: Vec::new(),
+            diagnostics: Vec::new(),
+            last_error: None,
+            ipc_diagnostics: None,
+        };
+        assert_eq!(
+            tray_health_from_status(&status),
+            TrayHealthState::Disconnected
+        );
+    }
+
+    #[test]
+    fn tray_health_from_status_healthy_pcsc_is_healthy() {
+        let status = DesktopDaemonStatus {
+            healthy: true,
+            pcsc_available: true,
+            active_session_count: 3,
+            readers: Vec::new(),
+            diagnostics: Vec::new(),
+            last_error: None,
+            ipc_diagnostics: None,
+        };
+        assert_eq!(
+            tray_health_from_status(&status),
+            TrayHealthState::Healthy { active_sessions: 3 }
+        );
+    }
+
+    #[test]
+    fn tray_health_from_status_healthy_no_pcsc_is_degraded() {
+        let status = DesktopDaemonStatus {
+            healthy: true,
+            pcsc_available: false,
+            active_session_count: 0,
+            readers: Vec::new(),
+            diagnostics: Vec::new(),
+            last_error: None,
+            ipc_diagnostics: None,
+        };
+        assert_eq!(
+            tray_health_from_status(&status),
+            TrayHealthState::Degraded { active_sessions: 0 }
+        );
+    }
+
+    #[test]
+    fn to_desktop_status_propagates_ipc_diagnostics() {
+        let daemon_status = openausweis_ipc::DaemonStatus {
+            healthy: true,
+            pcsc_available: true,
+            active_session_count: 1,
+            readers: Vec::new(),
+            diagnostics: Vec::new(),
+            last_error: None,
+            ipc_diagnostics: openausweis_ipc::IpcDiagnostics {
+                request_count: 42,
+                error_count: 3,
+                validation_rejections: 1,
+                connection_failures: 2,
+            },
+        };
+
+        let desktop = to_desktop_status(daemon_status);
+        let ipc = desktop.ipc_diagnostics.expect("ipc_diagnostics should be Some");
+        assert_eq!(ipc.request_count, 42);
+        assert_eq!(ipc.error_count, 3);
+        assert_eq!(ipc.validation_rejections, 1);
+        assert_eq!(ipc.connection_failures, 2);
+    }
+
+    #[test]
+    fn disconnected_status_has_no_ipc_diagnostics() {
+        let status = disconnected_status("stream failed".to_string());
+        assert!(status.ipc_diagnostics.is_none());
     }
 }

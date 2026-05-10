@@ -30,6 +30,12 @@ type DaemonStatus = {
   readers: { name: string; cardPresent: boolean; error?: string | null }[];
   diagnostics: string[];
   lastError?: string | null;
+  ipcDiagnostics?: {
+    requestCount: number;
+    errorCount: number;
+    validationRejections: number;
+    connectionFailures: number;
+  };
 };
 
 type OriginPolicy = {
@@ -44,15 +50,24 @@ type SessionUpdate = {
   error?: string | null;
 };
 
+type RuntimeContext = {
+  desktopEnv?: string | null;
+  sessionType?: string | null;
+  trayStrategy: string;
+  notes: string[];
+};
+
 export function App() {
   const [themePreference, setThemePreference] = useState<ThemePreference>("system");
   const [resolvedTheme, setResolvedTheme] = useState<ResolvedTheme>(() => getSystemTheme());
   const [status, setStatus] = useState("Disconnected");
   const [details, setDetails] = useState("No probe executed yet");
+  const [probeInFlight, setProbeInFlight] = useState(false);
   const [pcscAvailable, setPcscAvailable] = useState(false);
   const [readerStatus, setReaderStatus] = useState<DaemonStatus["readers"]>([]);
   const [diagnostics, setDiagnostics] = useState<string[]>([]);
   const [lastDiagnosticsRunAt, setLastDiagnosticsRunAt] = useState<string | null>(null);
+  const [ipcDiagnostics, setIpcDiagnostics] = useState<DaemonStatus["ipcDiagnostics"] | null>(null);
   const [hotplugOpen, setHotplugOpen] = useState(false);
   const [exactOriginsInput, setExactOriginsInput] = useState("");
   const [suffixesInput, setSuffixesInput] = useState("");
@@ -66,6 +81,7 @@ export function App() {
   const [submitPinBusy, setSubmitPinBusy] = useState(false);
   const [sessionResultMessage, setSessionResultMessage] = useState<string | null>(null);
   const [sessionCompletedAt, setSessionCompletedAt] = useState<string | null>(null);
+  const [runtimeContext, setRuntimeContext] = useState<RuntimeContext | null>(null);
 
   useEffect(() => {
     const storedPreference = parseStoredTheme(window.localStorage.getItem(THEME_STORAGE_KEY));
@@ -102,6 +118,7 @@ export function App() {
 
   useEffect(() => {
     void loadPolicy();
+    void loadRuntimeContext();
   }, []);
 
   useEffect(() => {
@@ -158,6 +175,7 @@ export function App() {
     );
     setPcscAvailable(response.pcscAvailable);
     setReaderStatus(response.readers);
+    setIpcDiagnostics(response.ipcDiagnostics || null);
     const baseDiagnostics = [...response.diagnostics];
     if (response.lastError) {
       baseDiagnostics.push(`Last error: ${response.lastError}`);
@@ -175,6 +193,7 @@ export function App() {
   }
 
   async function handleProbeDaemon() {
+    setProbeInFlight(true);
     try {
       const response = await invoke<DaemonStatus>("probe_daemon_status");
       applyDaemonStatus(response);
@@ -183,6 +202,8 @@ export function App() {
       setDetails(`Probe failed: ${String(error)}`);
       setReaderStatus([]);
       setDiagnostics([`Probe failed: ${String(error)}`]);
+    } finally {
+      setProbeInFlight(false);
     }
   }
 
@@ -226,6 +247,15 @@ export function App() {
     }
   }
 
+  async function loadRuntimeContext() {
+    try {
+      const context = await invoke<RuntimeContext>("get_runtime_context");
+      setRuntimeContext(context);
+    } catch {
+      setRuntimeContext(null);
+    }
+  }
+
   async function handleCancelActiveSession() {
     if (!sessionUpdate.sessionId) {
       return;
@@ -257,6 +287,42 @@ export function App() {
     }
   }
 
+  function lifecycleStateLabel(): { label: string; tone: "ok" | "warn" | "bad" } {
+    if (probeInFlight) {
+      return { label: "Probing daemon startup state", tone: "warn" };
+    }
+
+    if (status === "Connected" && sessionUpdate.connected) {
+      return { label: "Ready for authentication", tone: "ok" };
+    }
+
+    if (status === "Connected" && !sessionUpdate.connected) {
+      return { label: "Daemon ready, session stream recovering", tone: "warn" };
+    }
+
+    if (status !== "Connected" && sessionUpdate.connected) {
+      return { label: "Session stream live, daemon status recovering", tone: "warn" };
+    }
+
+    return { label: "Waiting for daemon startup", tone: "bad" };
+  }
+
+  function sessionStateHint(): string {
+    switch (sessionUpdate.state) {
+      case "PIN_ENTRY":
+        return "PIN entry requested. Enter the card PIN to continue.";
+      case "CARD_INTERACTION":
+        return "Card interaction in progress. Keep card and reader connected.";
+      case "COMPLETED":
+        return "Authentication completed. The browser handoff can now continue.";
+      case "ERROR":
+        return "Authentication failed. Review diagnostics and start a new session.";
+      case "IDLE":
+      default:
+        return "No active authentication session.";
+    }
+  }
+
   async function handleSubmitPin() {
     if (!sessionUpdate.sessionId) {
       return;
@@ -279,6 +345,7 @@ export function App() {
   }
 
   const showPinModal = sessionUpdate.sessionId && sessionUpdate.state === "PIN_ENTRY";
+  const lifecycleState = lifecycleStateLabel();
 
   return (
     <main className="app-shell">
@@ -318,9 +385,14 @@ export function App() {
           <span className="value">{status}</span>
         </div>
         <p className="subtitle">{details}</p>
+        <div className={`lifecycle-banner lifecycle-${lifecycleState.tone}`} role="status" aria-live="polite">
+          <strong>Lifecycle:</strong> {lifecycleState.label}
+        </div>
 
         <div className="actions">
-          <button onClick={handleProbeDaemon}>Probe daemon</button>
+          <button onClick={handleProbeDaemon} disabled={probeInFlight}>
+            {probeInFlight ? "Probing..." : "Probe daemon"}
+          </button>
           <button className="secondary" onClick={loadPolicy}>Reload policy</button>
         </div>
 
@@ -336,6 +408,7 @@ export function App() {
             State: {sessionUpdate.state ?? "IDLE"}
             {sessionUpdate.sessionId ? ` | Session: ${sessionUpdate.sessionId}` : ""}
           </p>
+          <p className="subtitle session-hint">{sessionStateHint()}</p>
           {sessionUpdate.sessionId ? (
             <div className="actions">
               <button className="secondary" onClick={handleCancelActiveSession}>
@@ -425,6 +498,29 @@ export function App() {
               </ul>
             </>
           ) : null}
+          {ipcDiagnostics ? (
+            <div className="ipc-diagnostics">
+              <h3>IPC Metrics</h3>
+              <div className="metrics-grid">
+                <div className="metric">
+                  <span className="metric-label">Requests</span>
+                  <span className="metric-value">{ipcDiagnostics.requestCount}</span>
+                </div>
+                <div className="metric">
+                  <span className="metric-label">Errors</span>
+                  <span className="metric-value error">{ipcDiagnostics.errorCount}</span>
+                </div>
+                <div className="metric">
+                  <span className="metric-label">Validation Rejections</span>
+                  <span className="metric-value error">{ipcDiagnostics.validationRejections}</span>
+                </div>
+                <div className="metric">
+                  <span className="metric-label">Connection Failures</span>
+                  <span className="metric-value error">{ipcDiagnostics.connectionFailures}</span>
+                </div>
+              </div>
+            </div>
+          ) : null}
         </section>
 
         <section className="policy-panel">
@@ -453,6 +549,23 @@ export function App() {
 
           <p className="subtitle">{policyState}</p>
         </section>
+
+        {runtimeContext ? (
+          <section className="runtime-panel">
+            <h2>Desktop Runtime</h2>
+            <p className="subtitle">
+              Desktop: {runtimeContext.desktopEnv ?? "unknown"} | Session: {runtimeContext.sessionType ?? "unknown"}
+            </p>
+            <p className="subtitle">Tray strategy: {runtimeContext.trayStrategy}</p>
+            {runtimeContext.notes.length > 0 ? (
+              <ul className="diagnostics-list">
+                {runtimeContext.notes.map((note, index) => (
+                  <li key={`${note}-${index}`}>{note}</li>
+                ))}
+              </ul>
+            ) : null}
+          </section>
+        ) : null}
       </section>
 
       {showPinModal ? (

@@ -5,7 +5,8 @@ use auth_executor::AuthExecutor;
 use anyhow::{Context, Result};
 use openausweis_core::CardSubsystem;
 use openausweis_ipc::{
-    ClientRequest, DaemonResponse, DaemonStatus, ReaderStatus, RpcEnvelope, IPC_PROTOCOL_VERSION,
+    ClientRequest, DaemonResponse, DaemonStatus, IpcDiagnostics, ReaderStatus, RpcEnvelope,
+    IPC_PROTOCOL_VERSION,
 };
 use openausweis_pcsc::PcscSubsystem;
 use session::SessionManager;
@@ -15,6 +16,7 @@ use std::time::Duration as StdDuration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::time::{sleep, Duration as TokioDuration};
 use tracing::{error, info, warn};
 
@@ -31,10 +33,55 @@ const SESSION_TTL_SECONDS: u64 = 5 * 60;
 
 static LAST_LOGGED_PCSC_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
+#[derive(Debug, Clone)]
+struct DaemonDiagnostics {
+    requests: u64,
+    errors: u64,
+    validation_rejections: u64,
+}
+
+impl DaemonDiagnostics {
+    fn incr_request(&mut self) {
+        self.requests = self.requests.saturating_add(1);
+    }
+
+    fn incr_error(&mut self) {
+        self.errors = self.errors.saturating_add(1);
+    }
+
+    fn incr_validation_rejection(&mut self) {
+        self.validation_rejections = self.validation_rejections.saturating_add(1);
+    }
+
+    fn to_ipc(&self) -> IpcDiagnostics {
+        IpcDiagnostics {
+            request_count: self.requests,
+            error_count: self.errors,
+            validation_rejections: self.validation_rejections,
+            connection_failures: 0,
+        }
+    }
+}
+
+static DAEMON_DIAGNOSTICS: OnceLock<Mutex<DaemonDiagnostics>> = OnceLock::new();
+
+fn get_diagnostics() -> DaemonDiagnostics {
+    let lock = DAEMON_DIAGNOSTICS.get_or_init(|| {
+        Mutex::new(DaemonDiagnostics {
+            requests: 0,
+            errors: 0,
+            validation_rejections: 0,
+        })
+    });
+
+    lock.lock().expect("diagnostics lock poisoned").clone()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_logging();
     let socket_path = daemon_socket_path();
+    validate_startup_environment(&socket_path)?;
     ensure_socket_parent_dir(&socket_path).await?;
     remove_stale_socket(&socket_path).await?;
     let card_subsystem: Arc<dyn CardSubsystem> = Arc::new(PcscSubsystem);
@@ -45,21 +92,64 @@ async fn main() -> Result<()> {
 
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("failed to bind unix socket at {}", socket_path.display()))?;
+    lock_down_socket_permissions(&socket_path).await?;
     info!(socket = %socket_path.display(), "daemon started");
 
+    // Set up signal handlers for graceful shutdown
+    let mut sigterm =
+        signal(SignalKind::terminate()).context("failed to set up SIGTERM handler")?;
+    let mut sigint = signal(SignalKind::interrupt()).context("failed to set up SIGINT handler")?;
+
     loop {
-        let (stream, _) = listener.accept().await.context("accept failed")?;
-        let card_subsystem = Arc::clone(&card_subsystem);
-        let auth_executor = Arc::clone(&auth_executor);
-        let session_manager = Arc::clone(&session_manager);
-        tokio::spawn(async move {
-            if let Err(err) =
-                handle_connection(stream, &*card_subsystem, &auth_executor, &session_manager).await
-            {
-                error!(error = %err, "connection error");
+        tokio::select! {
+            accept_result = listener.accept() => {
+                let (stream, _) = accept_result.context("accept failed")?;
+                let card_subsystem = Arc::clone(&card_subsystem);
+                let auth_executor = Arc::clone(&auth_executor);
+                let session_manager = Arc::clone(&session_manager);
+                tokio::spawn(async move {
+                    if let Err(err) =
+                        handle_connection(stream, &*card_subsystem, &auth_executor, &session_manager).await
+                    {
+                        error!(error = %err, "connection error");
+                    }
+                });
             }
-        });
+            _ = sigterm.recv() => {
+                info!("received SIGTERM, initiating graceful shutdown");
+                break;
+            }
+            _ = sigint.recv() => {
+                info!("received SIGINT, initiating graceful shutdown");
+                break;
+            }
+        }
     }
+
+    // Clean up: close listener and remove socket file
+    drop(listener);
+    remove_stale_socket(&socket_path).await?;
+    info!(socket = %socket_path.display(), "daemon shut down cleanly");
+
+    Ok(())
+}
+
+async fn lock_down_socket_permissions(socket_path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        tokio::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to lock down daemon socket permissions at {}",
+                    socket_path.display()
+                )
+            })?;
+    }
+
+    Ok(())
 }
 
 fn init_logging() {
@@ -68,6 +158,40 @@ fn init_logging() {
         .with_target(false)
         .compact()
         .init();
+}
+
+fn validate_startup_environment(socket_path: &Path) -> Result<()> {
+    // Verify socket path is in a safe location (XDG_RUNTIME_DIR or /tmp)
+    let socket_str = socket_path.to_string_lossy().to_string();
+    let xdg_runtime = std::env::var("XDG_RUNTIME_DIR").ok();
+    let is_in_runtime_dir = xdg_runtime
+        .as_ref()
+        .map(|rt| socket_str.starts_with(rt))
+        .unwrap_or(false);
+    let is_in_tmp = socket_str.starts_with("/tmp/");
+
+    if !is_in_runtime_dir && !is_in_tmp {
+        warn!(
+            socket = %socket_path.display(),
+            xdg_runtime = ?xdg_runtime,
+            "socket path is not in XDG_RUNTIME_DIR or /tmp; portability may be affected"
+        );
+    }
+
+    // Verify socket parent directory can be created (early check)
+    if let Some(parent) = socket_path.parent() {
+        if parent.as_os_str().is_empty() {
+            return Err(anyhow::anyhow!("invalid socket path parent"));
+        }
+    }
+
+    info!(
+        socket = %socket_path.display(),
+        xdg_runtime_dir = ?xdg_runtime,
+        "startup validation: socket path is acceptable"
+    );
+
+    Ok(())
 }
 
 async fn remove_stale_socket(path: &Path) -> Result<()> {
@@ -133,6 +257,19 @@ async fn handle_connection(
     while let Some(line) = lines.next_line().await.context("failed to read line")? {
         let request: RpcEnvelope<ClientRequest> =
             serde_json::from_str(&line).context("invalid request json")?;
+
+        {
+            let lock = DAEMON_DIAGNOSTICS.get_or_init(|| {
+                Mutex::new(DaemonDiagnostics {
+                    requests: 0,
+                    errors: 0,
+                    validation_rejections: 0,
+                })
+            });
+            let mut diag = lock.lock().expect("diagnostics lock poisoned");
+            diag.incr_request();
+        }
+
         if request.protocol_version != IPC_PROTOCOL_VERSION {
             let envelope = RpcEnvelope::new(
                 request.request_id,
@@ -144,6 +281,20 @@ async fn handle_connection(
                     ),
                 },
             );
+
+            {
+                let lock = DAEMON_DIAGNOSTICS.get_or_init(|| {
+                    Mutex::new(DaemonDiagnostics {
+                        requests: 0,
+                        errors: 0,
+                        validation_rejections: 0,
+                    })
+                });
+                let mut diag = lock.lock().expect("diagnostics lock poisoned");
+                diag.incr_error();
+                diag.incr_validation_rejection();
+            }
+
             write_envelope(&mut writer, &envelope).await?;
             continue;
         }
@@ -168,6 +319,18 @@ async fn handle_connection(
 
         let response =
             route_request(request.payload, card_subsystem, auth_executor, session_manager).await;
+
+        if matches!(response, DaemonResponse::Error { .. }) {
+            let lock = DAEMON_DIAGNOSTICS.get_or_init(|| {
+                Mutex::new(DaemonDiagnostics {
+                    requests: 0,
+                    errors: 0,
+                    validation_rejections: 0,
+                })
+            });
+            let mut diag = lock.lock().expect("diagnostics lock poisoned");
+            diag.incr_error();
+        }
 
         let envelope = RpcEnvelope::new(request.request_id, response);
         write_envelope(&mut writer, &envelope).await?;
@@ -298,6 +461,8 @@ async fn build_daemon_status(
 
     log_pcsc_error_if_changed(&last_error);
 
+    let ipc_diagnostics = get_diagnostics().to_ipc();
+
     DaemonStatus {
         healthy: true,
         pcsc_available: snapshot.pcsc_available,
@@ -313,6 +478,7 @@ async fn build_daemon_status(
             .collect(),
         diagnostics,
         last_error,
+        ipc_diagnostics,
     }
 }
 

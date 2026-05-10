@@ -333,6 +333,15 @@ check_daemon_socket_layout() {
 
   if [[ -S "$socket_path" ]]; then
     log_pass "Daemon socket exists: $socket_path"
+    local socket_perms
+    socket_perms="$(stat -c '%a' "$socket_path" 2>/dev/null || echo "")"
+    if [[ -n "$socket_perms" && "$socket_perms" == "600" ]]; then
+      log_pass "Daemon socket permissions are 600"
+    else
+      log_warn_fix \
+        "Daemon socket permissions are ${socket_perms:-unknown}; expected 600" \
+        "Restart daemon from current build so it recreates socket with hardened permissions"
+    fi
   else
     log_warn_fix \
       "Daemon socket not present (daemon may be stopped): $socket_path" \
