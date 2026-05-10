@@ -816,19 +816,24 @@ export function App() {
                 <ul className="onboarding-list">
                   {onboardingChecklist.map((step) => (
                     <li key={step.id} className={step.done ? "onboarding-step done" : "onboarding-step"}>
-                      <p className="onboarding-step-row">{step.done ? "Done" : "To do"} - {step.label}</p>
-                      <p className="onboarding-hint">{step.hint}</p>
+                      <span className="onboarding-step-icon" aria-hidden="true">
+                        {step.done ? "✓" : ""}
+                      </span>
+                      <div className="onboarding-step-body">
+                        <p className="onboarding-step-row">{step.label}</p>
+                        <p className="onboarding-hint">{step.hint}</p>
+                      </div>
                     </li>
                   ))}
                 </ul>
                 {nextOnboardingStep ? (
                   <p className="onboarding-next" role="status" aria-live="polite">
-                    Next required step: {nextOnboardingStep.label}
+                    Next step: {nextOnboardingStep.label}
                   </p>
                 ) : null}
                 <div className="actions">
                   <button className="secondary" onClick={handleProbeDaemon} disabled={probeInFlight}>
-                    {probeInFlight ? "Checking..." : "Refresh setup status"}
+                    {probeInFlight ? <><span className="btn-spinner" aria-hidden="true" />Checking…</> : "Refresh setup status"}
                   </button>
                   {!sessionUpdate.sessionId && canStartAuthentication ? (
                     <button type="button" onClick={handleStartBrowserAuthentication}>
@@ -885,7 +890,7 @@ export function App() {
                   </button>
                 )}
                 <button className="secondary" onClick={handleProbeDaemon} disabled={probeInFlight}>
-                  {probeInFlight ? "Checking..." : "Refresh status"}
+                  {probeInFlight ? <><span className="btn-spinner" aria-hidden="true" />Checking…</> : "Refresh status"}
                 </button>
               </div>
               {!canStartAuthentication ? (
@@ -924,9 +929,9 @@ export function App() {
                 <p className="reader-error" role="alert">{readableSessionError(sessionUpdate.error)}</p>
               ) : null}
               {sessionResultMessage ? (
-                <p className="session-result">
+                <p className={`session-result${sessionUpdate.state === "ERROR" ? " error" : ""}`}>
                   {sessionResultMessage}
-                  {sessionCompletedAt ? ` (${sessionCompletedAt})` : ""}
+                  {sessionCompletedAt ? ` · ${sessionCompletedAt}` : ""}
                 </p>
               ) : null}
 
@@ -934,7 +939,10 @@ export function App() {
                 <span className="label">Last activity</span>
                 {latestAuthTimelineEntry ? (
                   <span className="value">
-                    {latestAuthTimelineEntry.stage} - {latestAuthTimelineEntry.message} ({formatTimestamp(latestAuthTimelineEntry.at)})
+                    {latestAuthTimelineEntry.stage} — {latestAuthTimelineEntry.message}
+                    <span style={{ color: 'var(--muted)', fontWeight: 400 }}>
+                      {" · "}{formatTimestamp(latestAuthTimelineEntry.at)}
+                    </span>
                   </span>
                 ) : (
                   <span className="subtitle">No sign-in activity yet.</span>
@@ -1269,7 +1277,7 @@ export function App() {
               {pinError ? <p className="reader-error" id="pin-modal-error">{pinError}</p> : null}
               <div className="actions">
                 <button type="submit" disabled={submitPinBusy || pinInput.length !== 6}>
-                  {submitPinBusy ? "Submitting..." : "Submit PIN"}
+                  {submitPinBusy ? <><span className="btn-spinner" aria-hidden="true" />Submitting…</> : "Submit PIN"}
                 </button>
                 <button type="button" className="secondary" onClick={handleCancelActiveSession} disabled={submitPinBusy}>
                   Cancel
