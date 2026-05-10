@@ -16,6 +16,7 @@ use std::time::Instant;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
+use tauri_plugin_notification::NotificationExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
@@ -61,23 +62,26 @@ enum TrayHealthState {
 }
 
 static LAST_TRAY_STATE: OnceLock<Mutex<TrayHealthState>> = OnceLock::new();
+static LAST_SESSION_NOTIFICATION_KEY: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 fn tray_tooltip_for_state(state: &TrayHealthState) -> String {
     match state {
         TrayHealthState::Unknown => "OpenAusweis".to_string(),
         TrayHealthState::Healthy {
             active_sessions: 0,
-        } => "OpenAusweis\nDaemon: ready".to_string(),
+        } => "OpenAusweis\nReady for secure sign-in".to_string(),
         TrayHealthState::Healthy { active_sessions } => {
-            format!("OpenAusweis\nSession active ({active_sessions})")
+            format!("OpenAusweis\nAuthentication in progress ({active_sessions})")
         }
         TrayHealthState::Degraded {
             active_sessions: 0,
-        } => "OpenAusweis\nDaemon: running (no card reader)".to_string(),
+        } => "OpenAusweis\nReader not detected".to_string(),
         TrayHealthState::Degraded { active_sessions } => {
-            format!("OpenAusweis\nSession active ({active_sessions}) — no card reader")
+            format!(
+                "OpenAusweis\nAuthentication in progress ({active_sessions}) — reader not detected"
+            )
         }
-        TrayHealthState::Disconnected => "OpenAusweis\nDaemon: disconnected".to_string(),
+        TrayHealthState::Disconnected => "OpenAusweis\nSecure service unavailable".to_string(),
     }
 }
 
@@ -110,6 +114,44 @@ fn update_tray_tooltip(app: &AppHandle, new_state: TrayHealthState) {
     let tooltip = tray_tooltip_for_state(&new_state);
     if let Some(tray) = app.tray_by_id("main") {
         let _ = tray.set_tooltip(Some(tooltip.as_str()));
+    }
+}
+
+fn maybe_notify_auth_state(app: &AppHandle, update: &DesktopSessionUpdate) {
+    if !update.connected {
+        return;
+    }
+
+    let state = update.state.as_deref().unwrap_or("IDLE");
+    let session_id = update.session_id.as_deref().unwrap_or("none");
+    let key = format!("{session_id}:{state}");
+
+    let lock = LAST_SESSION_NOTIFICATION_KEY.get_or_init(|| Mutex::new(None));
+    let mut last_key = lock.lock().expect("session notification state lock poisoned");
+    if last_key.as_deref() == Some(key.as_str()) {
+        return;
+    }
+    *last_key = Some(key);
+    drop(last_key);
+
+    let notification = match state {
+        "PIN_ENTRY" => Some((
+            "OpenAusweis: PIN required",
+            "Enter your ID card PIN to continue secure sign-in.",
+        )),
+        "COMPLETED" => Some((
+            "OpenAusweis: Authentication complete",
+            "Return to your browser tab to finish sign-in.",
+        )),
+        "ERROR" => Some((
+            "OpenAusweis: Authentication needs attention",
+            "Authentication could not be completed. Start again to retry.",
+        )),
+        _ => None,
+    };
+
+    if let Some((title, body)) = notification {
+        let _ = app.notification().builder().title(title).body(body).show();
     }
 }
 
@@ -149,6 +191,7 @@ struct DesktopSessionUpdate {
     session_id: Option<String>,
     state: Option<String>,
     error: Option<String>,
+    handoff_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -174,9 +217,29 @@ async fn probe_daemon_status() -> std::result::Result<DesktopDaemonStatus, Strin
 
 #[tauri::command]
 async fn start_test_session() -> std::result::Result<DesktopSessionUpdate, String> {
+    start_session_with_handoff(Some("desktop-test-session".to_string()), None).await
+}
+
+#[tauri::command]
+async fn start_desktop_handoff_session(
+    handoff_id: String,
+    relying_party: Option<String>,
+) -> std::result::Result<DesktopSessionUpdate, String> {
+    if handoff_id.trim().is_empty() {
+        return Err("handoff id must be non-empty".to_string());
+    }
+
+    start_session_with_handoff(Some(handoff_id), relying_party).await
+}
+
+async fn start_session_with_handoff(
+    handoff_id: Option<String>,
+    relying_party: Option<String>,
+) -> std::result::Result<DesktopSessionUpdate, String> {
+    let relying_party = resolve_relying_party(relying_party)?;
     let response = send_unary_daemon_request(ClientRequest::StartSession {
-        relying_party: "https://localhost".to_string(),
-        handoff_id: Some("desktop-test-session".to_string()),
+        relying_party,
+        handoff_id,
     })
     .await
     .map_err(|err| format!("{err}"))?;
@@ -185,18 +248,39 @@ async fn start_test_session() -> std::result::Result<DesktopSessionUpdate, Strin
         DaemonResponse::SessionStarted {
             session_id,
             state,
-            ..
+            handoff_id,
         } => Ok(DesktopSessionUpdate {
             connected: true,
             session_id: Some(session_id.to_string()),
             state: Some(session_state_wire_value(state).to_string()),
             error: None,
+            handoff_id,
         }),
         DaemonResponse::Error { code, message } => {
             Err(format_start_session_error(&code, &message))
         }
         other => Err(format!("unexpected daemon response: {other:?}")),
     }
+}
+
+fn resolve_relying_party(relying_party: Option<String>) -> std::result::Result<String, String> {
+    let candidate = relying_party.unwrap_or_else(|| "https://localhost".to_string());
+    let trimmed = candidate.trim();
+    if trimmed.is_empty() {
+        return Err("relying party origin must be non-empty".to_string());
+    }
+
+    let parsed = url::Url::parse(trimmed)
+        .map_err(|err| format!("invalid relying party origin: {err}"))?;
+    if parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("relying party origin must not include path/query/fragment".to_string());
+    }
+
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err("relying party origin must use http or https".to_string());
+    }
+
+    Ok(parsed.origin().ascii_serialization())
 }
 
 fn format_start_session_error(code: &str, message: &str) -> String {
@@ -224,12 +308,13 @@ async fn submit_session_pin(session_id: String, pin: String) -> std::result::Res
             session_id,
             state,
             error,
-            ..
+            handoff_id,
         } => Ok(DesktopSessionUpdate {
             connected: true,
             session_id: Some(session_id.to_string()),
             state: Some(session_state_wire_value(state).to_string()),
             error,
+            handoff_id,
         }),
         DaemonResponse::Error { code, message } => Err(format!("daemon error {code}: {message}")),
         other => Err(format!("unexpected daemon response: {other:?}")),
@@ -962,6 +1047,7 @@ async fn stream_daemon_sessions_once(app: &AppHandle) -> Result<()> {
             session_id: None,
             state: Some("IDLE".to_string()),
             error: None,
+            handoff_id: None,
         },
     )
     .context("failed to emit initial daemon session event")?;
@@ -972,6 +1058,7 @@ async fn stream_daemon_sessions_once(app: &AppHandle) -> Result<()> {
         .context("failed to read daemon session stream response")?
     {
         let update = parse_session_stream_response_line(request_id, &line)?;
+        maybe_notify_auth_state(app, &update);
         app.emit(DAEMON_SESSION_EVENT, update)
             .context("failed to emit daemon session event")?;
     }
@@ -1013,18 +1100,20 @@ fn parse_session_stream_response_line(
             session_id,
             state,
             error,
-            ..
+            handoff_id,
         } => Ok(DesktopSessionUpdate {
             connected: true,
             session_id: Some(session_id.to_string()),
             state: Some(session_state_wire_value(state).to_string()),
             error,
+            handoff_id,
         }),
         DaemonResponse::SessionCancelled { .. } => Ok(DesktopSessionUpdate {
             connected: true,
             session_id: None,
             state: Some("IDLE".to_string()),
             error: None,
+            handoff_id: None,
         }),
         DaemonResponse::Error { code, message } => {
             Err(anyhow::anyhow!("daemon session stream error {code}: {message}"))
@@ -1052,6 +1141,7 @@ fn disconnected_session_update(details: String) -> DesktopSessionUpdate {
         session_id: None,
         state: Some("IDLE".to_string()),
         error: Some(details),
+        handoff_id: None,
     }
 }
 
@@ -1117,9 +1207,10 @@ fn toggle_main_window(app: &AppHandle) {
 }
 
 fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
-    let toggle_item = MenuItem::with_id(app, TRAY_ACTION_TOGGLE, "Show/Hide OpenAusweis", true, None::<&str>)?;
-    let show_item = MenuItem::with_id(app, TRAY_ACTION_SHOW, "Show Window", true, None::<&str>)?;
-    let hide_item = MenuItem::with_id(app, TRAY_ACTION_HIDE, "Hide Window", true, None::<&str>)?;
+    let toggle_item =
+        MenuItem::with_id(app, TRAY_ACTION_TOGGLE, "Open/Hide OpenAusweis", true, None::<&str>)?;
+    let show_item = MenuItem::with_id(app, TRAY_ACTION_SHOW, "Open OpenAusweis", true, None::<&str>)?;
+    let hide_item = MenuItem::with_id(app, TRAY_ACTION_HIDE, "Hide window", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, TRAY_ACTION_QUIT, "Quit", true, None::<&str>)?;
     let tray_menu = Menu::with_items(app, &[&toggle_item, &show_item, &hide_item, &quit_item])?;
 
@@ -1153,6 +1244,7 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
@@ -1168,6 +1260,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             probe_daemon_status,
             start_test_session,
+            start_desktop_handoff_session,
             submit_session_pin,
             cancel_session,
             get_origin_policy,
@@ -1370,33 +1463,48 @@ mod tests {
     #[test]
     fn tray_tooltip_healthy_no_sessions_shows_ready() {
         let s = tray_tooltip_for_state(&TrayHealthState::Healthy { active_sessions: 0 });
-        assert!(s.contains("ready"), "expected 'ready' in: {s}");
+        assert!(s.contains("Ready"), "expected 'Ready' in: {s}");
     }
 
     #[test]
     fn tray_tooltip_healthy_with_sessions_shows_count() {
         let s = tray_tooltip_for_state(&TrayHealthState::Healthy { active_sessions: 2 });
-        assert!(s.contains("Session active"), "expected session info in: {s}");
+        assert!(
+            s.contains("Authentication in progress"),
+            "expected authentication info in: {s}"
+        );
         assert!(s.contains("2"), "expected count in: {s}");
     }
 
     #[test]
     fn tray_tooltip_degraded_no_sessions_mentions_card_reader() {
         let s = tray_tooltip_for_state(&TrayHealthState::Degraded { active_sessions: 0 });
-        assert!(s.contains("no card reader"), "expected card reader note in: {s}");
+        assert!(
+            s.contains("Reader not detected"),
+            "expected reader note in: {s}"
+        );
     }
 
     #[test]
     fn tray_tooltip_degraded_with_sessions_shows_both() {
         let s = tray_tooltip_for_state(&TrayHealthState::Degraded { active_sessions: 1 });
-        assert!(s.contains("Session active"), "expected session info in: {s}");
-        assert!(s.contains("no card reader"), "expected card reader note in: {s}");
+        assert!(
+            s.contains("Authentication in progress"),
+            "expected authentication info in: {s}"
+        );
+        assert!(
+            s.contains("reader not detected"),
+            "expected reader note in: {s}"
+        );
     }
 
     #[test]
     fn tray_tooltip_disconnected_says_disconnected() {
         let s = tray_tooltip_for_state(&TrayHealthState::Disconnected);
-        assert!(s.contains("disconnected"), "expected disconnected in: {s}");
+        assert!(
+            s.contains("service unavailable"),
+            "expected service unavailable in: {s}"
+        );
     }
 
     #[test]

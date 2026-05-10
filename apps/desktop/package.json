@@ -7,6 +7,7 @@
     "dev": "vite --port ${OPENAUSWEIS_DESKTOP_PORT:-1420}",
     "build": "tsc -b && vite build",
     "lint": "echo \"No linter configured yet\"",
+    "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "tauri:dev": "npx tauri dev",
     "tauri:dev:snap-safe": "env -u GTK_EXE_PREFIX -u GTK_PATH -u GIO_MODULE_DIR -u GTK_IM_MODULE_FILE -u LOCPATH -u LD_LIBRARY_PATH -u PKG_CONFIG_PATH CARGO_BUILD_JOBS=1 npx tauri dev"
@@ -21,6 +22,7 @@
     "@types/react": "^18.3.8",
     "@types/react-dom": "^18.3.0",
     "typescript": "^5.8.3",
-    "vite": "^5.4.19"
+    "vite": "^5.4.19",
+    "vitest": "^4.1.5"
   }
 }

@@ -1,11 +1,32 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useEffect, useState } from "react";
+import {
+  appendTimelineEntry,
+  defaultUxMetrics,
+  handoffStatusLabelFromState,
+  metricsAfterStateTransition,
+  parseAuthTimeline,
+  parseUxMetrics,
+  pinPromptTransition,
+  preferredRelyingPartyFromOrigins,
+  type AuthTimelineEntry,
+  type UxMetrics,
+} from "./uxState";
 
 const THEME_STORAGE_KEY = "openausweis-theme";
+const ONBOARDING_STORAGE_KEY = "openausweis-onboarding-complete";
+const CONTRAST_STORAGE_KEY = "openausweis-high-contrast";
+const UX_METRICS_STORAGE_KEY = "openausweis-ux-metrics";
+const PREFERRED_RELYING_PARTY_STORAGE_KEY = "openausweis-preferred-relying-party";
+const AUTH_TIMELINE_STORAGE_KEY = "openausweis-auth-timeline";
+const DEVELOPER_MODE_STORAGE_KEY = "openausweis-developer-mode";
+const DIAGNOSTICS_DRAWER_OPEN_STORAGE_KEY = "openausweis-diagnostics-drawer-open";
 
 type ThemePreference = "system" | "light" | "dark";
 type ResolvedTheme = "light" | "dark";
+type AppView = "home" | "advanced";
 
 function getSystemTheme(): ResolvedTheme {
   if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
@@ -48,6 +69,7 @@ type SessionUpdate = {
   sessionId?: string | null;
   state?: string | null;
   error?: string | null;
+  handoffId?: string | null;
 };
 
 type RuntimeContext = {
@@ -60,8 +82,10 @@ type RuntimeContext = {
 export function App() {
   const [themePreference, setThemePreference] = useState<ThemePreference>("system");
   const [resolvedTheme, setResolvedTheme] = useState<ResolvedTheme>(() => getSystemTheme());
+  const [activeView, setActiveView] = useState<AppView>("home");
+  const [highContrast, setHighContrast] = useState(false);
+  const [onboardingComplete, setOnboardingComplete] = useState(false);
   const [status, setStatus] = useState("Disconnected");
-  const [details, setDetails] = useState("No probe executed yet");
   const [probeInFlight, setProbeInFlight] = useState(false);
   const [pcscAvailable, setPcscAvailable] = useState(false);
   const [readerStatus, setReaderStatus] = useState<DaemonStatus["readers"]>([]);
@@ -82,10 +106,30 @@ export function App() {
   const [sessionResultMessage, setSessionResultMessage] = useState<string | null>(null);
   const [sessionCompletedAt, setSessionCompletedAt] = useState<string | null>(null);
   const [runtimeContext, setRuntimeContext] = useState<RuntimeContext | null>(null);
+  const [lastSessionState, setLastSessionState] = useState<string>("IDLE");
+  const [lastPinPromptSessionId, setLastPinPromptSessionId] = useState<string | null>(null);
+  const [uxMetrics, setUxMetrics] = useState<UxMetrics>(defaultUxMetrics());
+  const [preferredRelyingParty, setPreferredRelyingParty] = useState("https://localhost");
+  const [authTimeline, setAuthTimeline] = useState<AuthTimelineEntry[]>([]);
+  const [trayActionMessage, setTrayActionMessage] = useState<string | null>(null);
+  const [uiAnnouncement, setUiAnnouncement] = useState<string>("OpenAusweis is ready.");
+  const [developerModeEnabled, setDeveloperModeEnabled] = useState(false);
+  const [diagnosticsDrawerOpen, setDiagnosticsDrawerOpen] = useState(false);
 
   useEffect(() => {
     const storedPreference = parseStoredTheme(window.localStorage.getItem(THEME_STORAGE_KEY));
     setThemePreference(storedPreference);
+    setOnboardingComplete(window.localStorage.getItem(ONBOARDING_STORAGE_KEY) === "true");
+    setHighContrast(window.localStorage.getItem(CONTRAST_STORAGE_KEY) === "true");
+    setUxMetrics(parseUxMetrics(window.localStorage.getItem(UX_METRICS_STORAGE_KEY)));
+    setPreferredRelyingParty(
+      window.localStorage.getItem(PREFERRED_RELYING_PARTY_STORAGE_KEY) || "https://localhost"
+    );
+    setAuthTimeline(parseAuthTimeline(window.localStorage.getItem(AUTH_TIMELINE_STORAGE_KEY)));
+    setDeveloperModeEnabled(window.localStorage.getItem(DEVELOPER_MODE_STORAGE_KEY) === "true");
+    setDiagnosticsDrawerOpen(
+      window.localStorage.getItem(DIAGNOSTICS_DRAWER_OPEN_STORAGE_KEY) === "true"
+    );
   }, []);
 
   useEffect(() => {
@@ -117,23 +161,165 @@ export function App() {
   }, [themePreference]);
 
   useEffect(() => {
+    window.localStorage.setItem(ONBOARDING_STORAGE_KEY, onboardingComplete ? "true" : "false");
+  }, [onboardingComplete]);
+
+  useEffect(() => {
+    window.localStorage.setItem(CONTRAST_STORAGE_KEY, highContrast ? "true" : "false");
+  }, [highContrast]);
+
+  useEffect(() => {
+    document.documentElement.setAttribute("data-contrast", highContrast ? "high" : "default");
+  }, [highContrast]);
+
+  useEffect(() => {
+    window.localStorage.setItem(UX_METRICS_STORAGE_KEY, JSON.stringify(uxMetrics));
+  }, [uxMetrics]);
+
+  useEffect(() => {
+    window.localStorage.setItem(PREFERRED_RELYING_PARTY_STORAGE_KEY, preferredRelyingParty);
+  }, [preferredRelyingParty]);
+
+  useEffect(() => {
+    window.localStorage.setItem(AUTH_TIMELINE_STORAGE_KEY, JSON.stringify(authTimeline));
+  }, [authTimeline]);
+
+  useEffect(() => {
+    window.localStorage.setItem(DEVELOPER_MODE_STORAGE_KEY, developerModeEnabled ? "true" : "false");
+  }, [developerModeEnabled]);
+
+  useEffect(() => {
+    window.localStorage.setItem(
+      DIAGNOSTICS_DRAWER_OPEN_STORAGE_KEY,
+      diagnosticsDrawerOpen ? "true" : "false"
+    );
+  }, [diagnosticsDrawerOpen]);
+
+  useEffect(() => {
     void loadPolicy();
     void loadRuntimeContext();
   }, []);
 
   useEffect(() => {
     if (sessionUpdate.state === "COMPLETED") {
-      setSessionResultMessage("Authentication placeholder completed successfully.");
+      setSessionResultMessage("Sign-in completed successfully.");
       setSessionCompletedAt(new Date().toLocaleTimeString());
     }
 
     if (sessionUpdate.state === "ERROR") {
       setSessionResultMessage(
-        sessionUpdate.error ? `Authentication failed: ${sessionUpdate.error}` : "Authentication failed."
+        sessionUpdate.error ? `Sign-in failed: ${sessionUpdate.error}` : "Sign-in failed."
       );
       setSessionCompletedAt(new Date().toLocaleTimeString());
     }
   }, [sessionUpdate.state, sessionUpdate.sessionId, sessionUpdate.error]);
+
+  useEffect(() => {
+    if (sessionUpdate.state === "PIN_ENTRY") {
+      setUiAnnouncement("PIN required. Enter your 6-digit PIN in the secure prompt.");
+      return;
+    }
+
+    if (sessionUpdate.state === "CARD_INTERACTION") {
+      setUiAnnouncement("Card verification in progress. Keep your card inserted.");
+      return;
+    }
+
+    if (sessionUpdate.state === "COMPLETED") {
+      setUiAnnouncement("Sign-in completed. Return to your browser tab.");
+      return;
+    }
+
+    if (sessionUpdate.state === "ERROR") {
+      setUiAnnouncement("Sign-in failed. Start again to retry.");
+      return;
+    }
+
+    if (status !== "Connected") {
+      setUiAnnouncement("OpenAusweis is reconnecting.");
+      return;
+    }
+
+    setUiAnnouncement("Ready for secure sign-in.");
+  }, [sessionUpdate.state, status]);
+
+  useEffect(() => {
+    const transition = pinPromptTransition(
+      uxMetrics,
+      sessionUpdate.state,
+      sessionUpdate.sessionId,
+      lastPinPromptSessionId
+    );
+    if (transition.changed) {
+      setLastPinPromptSessionId(transition.nextLastPinPromptSessionId);
+      setUxMetrics(transition.metrics);
+      setAuthTimeline((previous) =>
+        appendTimelineEntry(
+          previous,
+          {
+            stage: "PIN",
+            message: "PIN requested by identity card",
+            sessionId: sessionUpdate.sessionId,
+            handoffId: sessionUpdate.handoffId,
+          },
+          new Date().toISOString()
+        )
+      );
+    }
+  }, [
+    sessionUpdate.state,
+    sessionUpdate.sessionId,
+    sessionUpdate.handoffId,
+    lastPinPromptSessionId,
+    uxMetrics,
+  ]);
+
+  useEffect(() => {
+    if (lastSessionState === sessionUpdate.state) {
+      return;
+    }
+
+    setLastSessionState(sessionUpdate.state ?? "IDLE");
+
+    const nowIso = new Date().toISOString();
+    setUxMetrics((previous) => metricsAfterStateTransition(previous, sessionUpdate.state, nowIso));
+
+    if (sessionUpdate.state === "COMPLETED") {
+      setAuthTimeline((previous) =>
+        appendTimelineEntry(
+          previous,
+          {
+            stage: "COMPLETED",
+            message: "Sign-in completed",
+            sessionId: sessionUpdate.sessionId,
+            handoffId: sessionUpdate.handoffId,
+          },
+          nowIso
+        )
+      );
+    }
+
+    if (sessionUpdate.state === "ERROR") {
+      setAuthTimeline((previous) =>
+        appendTimelineEntry(
+          previous,
+          {
+            stage: "FAILED",
+            message: sessionUpdate.error ? `Sign-in failed: ${sessionUpdate.error}` : "Sign-in failed",
+            sessionId: sessionUpdate.sessionId,
+            handoffId: sessionUpdate.handoffId,
+          },
+          nowIso
+        )
+      );
+    }
+  }, [
+    lastSessionState,
+    sessionUpdate.state,
+    sessionUpdate.error,
+    sessionUpdate.sessionId,
+    sessionUpdate.handoffId,
+  ]);
 
   useEffect(() => {
     void handleProbeDaemon();
@@ -170,9 +356,6 @@ export function App() {
 
   function applyDaemonStatus(response: DaemonStatus) {
     setStatus(response.healthy ? "Connected" : "Unhealthy");
-    setDetails(
-      `PC/SC: ${response.pcscAvailable ? "available" : "unavailable"} | Readers: ${response.readers.length} | Sessions: ${response.activeSessionCount}`
-    );
     setPcscAvailable(response.pcscAvailable);
     setReaderStatus(response.readers);
     setIpcDiagnostics(response.ipcDiagnostics || null);
@@ -199,7 +382,6 @@ export function App() {
       applyDaemonStatus(response);
     } catch (error) {
       setStatus("Disconnected");
-      setDetails(`Probe failed: ${String(error)}`);
       setReaderStatus([]);
       setDiagnostics([`Probe failed: ${String(error)}`]);
     } finally {
@@ -217,6 +399,9 @@ export function App() {
       const policy = await invoke<OriginPolicy>("get_origin_policy");
       setExactOriginsInput(policy.allowedExactOrigins.join("\n"));
       setSuffixesInput(policy.allowedSuffixes.join("\n"));
+      if (!window.localStorage.getItem(PREFERRED_RELYING_PARTY_STORAGE_KEY)) {
+        setPreferredRelyingParty(preferredRelyingPartyFromOrigins(policy.allowedExactOrigins));
+      }
       setPolicyState("Policy loaded");
     } catch (error) {
       setPolicyState(`Load failed: ${String(error)}`);
@@ -241,6 +426,9 @@ export function App() {
           allowedSuffixes,
         },
       });
+      if (!allowedExactOrigins.includes(preferredRelyingParty)) {
+        setPreferredRelyingParty(preferredRelyingPartyFromOrigins(allowedExactOrigins));
+      }
       setPolicyState("Policy saved");
     } catch (error) {
       setPolicyState(`Save failed: ${String(error)}`);
@@ -263,63 +451,105 @@ export function App() {
 
     try {
       await invoke("cancel_session", { sessionId: sessionUpdate.sessionId });
-      setSessionResultMessage("Session cancelled.");
+      setSessionResultMessage("Sign-in cancelled.");
+      setUxMetrics((previous) => ({
+        ...previous,
+        authCancelledCount: previous.authCancelledCount + 1,
+      }));
+      setAuthTimeline((previous) =>
+        appendTimelineEntry(
+          previous,
+          {
+            stage: "CANCELLED",
+            message: "Sign-in cancelled by user",
+            sessionId: sessionUpdate.sessionId,
+            handoffId: sessionUpdate.handoffId,
+          },
+          new Date().toISOString()
+        )
+      );
     } catch (error) {
       setSessionUpdate((previous) => ({
         ...previous,
-        error: `Cancel failed: ${String(error)}`,
+        error: `Could not cancel authentication: ${String(error)}`,
       }));
     }
   }
 
-  async function handleStartTestSession() {
+  function createDesktopHandoffId(): string {
+    const random = Math.random().toString(16).slice(2, 10);
+    return `desktop-${Date.now()}-${random}`;
+  }
+
+  async function handleStartBrowserAuthentication() {
+    const handoffId = createDesktopHandoffId();
     try {
-      const update = await invoke<SessionUpdate>("start_test_session");
+      const update = await invoke<SessionUpdate>("start_desktop_handoff_session", {
+        handoffId,
+        relyingParty: preferredRelyingParty,
+      });
       setSessionUpdate(update);
       setPinError(null);
       setSessionResultMessage(null);
       setSessionCompletedAt(null);
+      setLastPinPromptSessionId(null);
+      setUxMetrics((previous) => ({
+        ...previous,
+        authStartedCount: previous.authStartedCount + 1,
+        lastAuthStartedAt: new Date().toISOString(),
+      }));
+      setAuthTimeline((previous) =>
+        appendTimelineEntry(
+          previous,
+          {
+            stage: "STARTED",
+            message: `Sign-in started for ${preferredRelyingParty}`,
+            sessionId: update.sessionId,
+            handoffId: update.handoffId ?? handoffId,
+          },
+          new Date().toISOString()
+        )
+      );
     } catch (error) {
       setSessionUpdate((previous) => ({
         ...previous,
-        error: `Start session failed: ${String(error)}`,
+        error: `Could not start sign-in: ${String(error)}`,
       }));
     }
   }
 
-  function lifecycleStateLabel(): { label: string; tone: "ok" | "warn" | "bad" } {
-    if (probeInFlight) {
-      return { label: "Probing daemon startup state", tone: "warn" };
+  async function handleHideWindowToTray() {
+    try {
+      await getCurrentWindow().hide();
+      setTrayActionMessage("OpenAusweis is still running in your system tray.");
+      setUiAnnouncement("Window hidden. OpenAusweis is still running in the system tray.");
+    } catch (error) {
+      setTrayActionMessage(`Could not hide window to tray: ${String(error)}`);
+      setUiAnnouncement("Could not hide window to tray.");
     }
+  }
 
-    if (status === "Connected" && sessionUpdate.connected) {
-      return { label: "Ready for authentication", tone: "ok" };
-    }
-
-    if (status === "Connected" && !sessionUpdate.connected) {
-      return { label: "Daemon ready, session stream recovering", tone: "warn" };
-    }
-
-    if (status !== "Connected" && sessionUpdate.connected) {
-      return { label: "Session stream live, daemon status recovering", tone: "warn" };
-    }
-
-    return { label: "Waiting for daemon startup", tone: "bad" };
+  function readableSessionError(value: string): string {
+    return value
+      .replaceAll("daemon error", "service error")
+      .replaceAll("daemon", "service")
+        .replaceAll("SESSION_ALREADY_ACTIVE", "A sign-in is already active")
+      .replaceAll("NOT_IMPLEMENTED", "not yet available");
   }
 
   function sessionStateHint(): string {
     switch (sessionUpdate.state) {
       case "PIN_ENTRY":
-        return "PIN entry requested. Enter the card PIN to continue.";
+        return "PIN entry requested. Enter your card PIN to continue in the browser.";
       case "CARD_INTERACTION":
-        return "Card interaction in progress. Keep card and reader connected.";
+        return "Identity card verification in progress. Keep your card inserted until your browser confirms success.";
       case "COMPLETED":
-        return "Authentication completed. The browser handoff can now continue.";
+        return "Sign-in complete. Return to your browser tab to finish.";
       case "ERROR":
-        return "Authentication failed. Review diagnostics and start a new session.";
+        return "Sign-in could not be completed. Start again to retry.";
       case "IDLE":
       default:
-        return "No active authentication session.";
+        return "No sign-in is currently running.";
     }
   }
 
@@ -344,256 +574,708 @@ export function App() {
     }
   }
 
+  function currentRequestTitle(): string {
+    if (!sessionUpdate.sessionId) {
+      return "No sign-in in progress";
+    }
+
+    switch (sessionUpdate.state) {
+      case "PIN_ENTRY":
+        return "PIN confirmation needed";
+      case "CARD_INTERACTION":
+        return "Card verification in progress";
+      case "COMPLETED":
+        return "Sign-in completed";
+      case "ERROR":
+        return "Sign-in needs attention";
+      case "IDLE":
+      default:
+        return "Sign-in request started";
+    }
+  }
+
+  function currentRequestActionHint(): string {
+    switch (sessionUpdate.state) {
+      case "PIN_ENTRY":
+        return "Enter your 6-digit PIN in the prompt and keep your card inserted.";
+      case "CARD_INTERACTION":
+        return "Please wait. Keep card and reader connected until completion.";
+      case "COMPLETED":
+        return "Go back to your browser tab to complete sign-in.";
+      case "ERROR":
+        return "Start a new sign-in attempt.";
+      case "IDLE":
+      default:
+        return "Start sign-in when your card and reader are ready.";
+    }
+  }
+
+  function linuxRuntimeHeadline(): string {
+    if (!runtimeContext) {
+      return "Linux environment loading";
+    }
+
+    if (runtimeContext.sessionType === "wayland") {
+      return "Wayland session detected";
+    }
+
+    if (runtimeContext.sessionType === "x11") {
+      return "X11 session detected";
+    }
+
+    return "Linux session detected";
+  }
+
+  function linuxRuntimeHint(): string {
+    if (!runtimeContext) {
+      return "Runtime details will appear when available.";
+    }
+
+    if (runtimeContext.sessionType === "wayland") {
+      return "Tray behavior depends on your desktop shell. Open Advanced if tray visibility seems limited.";
+    }
+
+    if (runtimeContext.sessionType === "x11") {
+      return "Tray behavior is fully supported in typical X11 desktop environments.";
+    }
+
+    return "Open Advanced for desktop-specific runtime notes.";
+  }
+
+  function primaryStatusLabel(): string {
+    if (status !== "Connected") {
+      return "OpenAusweis is reconnecting";
+    }
+    if (!pcscAvailable) {
+      return "Card access unavailable";
+    }
+    if (readerStatus.length === 0) {
+      return "Reader not detected";
+    }
+    if (!readerStatus.some((reader) => reader.cardPresent)) {
+      return "Insert your ID card";
+    }
+    return "Ready for secure sign-in";
+  }
+
+  function primaryStatusTone(): "ok" | "warn" | "bad" {
+    if (status !== "Connected" || !pcscAvailable) {
+      return "bad";
+    }
+    if (readerStatus.length === 0 || !readerStatus.some((reader) => reader.cardPresent)) {
+      return "warn";
+    }
+    return "ok";
+  }
+
+  function onboardingStepState(step: "service" | "reader" | "card" | "auth"): "done" | "todo" {
+    if (step === "service") {
+      return status === "Connected" && sessionUpdate.connected ? "done" : "todo";
+    }
+    if (step === "reader") {
+      return pcscAvailable && readerStatus.length > 0 ? "done" : "todo";
+    }
+    if (step === "card") {
+      return readerStatus.some((reader) => reader.cardPresent) ? "done" : "todo";
+    }
+    return sessionUpdate.state === "COMPLETED" ? "done" : "todo";
+  }
+
+  function onboardingStepHint(step: "service" | "reader" | "card" | "auth"): string {
+    if (step === "service") {
+      return status === "Connected" && sessionUpdate.connected
+        ? "OpenAusweis is ready."
+        : "OpenAusweis is reconnecting in the background.";
+    }
+
+    if (step === "reader") {
+      return pcscAvailable && readerStatus.length > 0
+        ? `${readerStatus.length} reader${readerStatus.length === 1 ? "" : "s"} detected.`
+        : "Connect your USB card reader.";
+    }
+
+    if (step === "card") {
+      return readerStatus.some((reader) => reader.cardPresent)
+        ? "Card detected and ready."
+        : "Insert your ID card into the reader.";
+    }
+
+    return sessionUpdate.state === "COMPLETED"
+      ? "First sign-in completed."
+      : "Start and complete one sign-in.";
+  }
+
+  function formatTimestamp(value: string | null): string {
+    if (!value) {
+      return "-";
+    }
+
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.valueOf())) {
+      return value;
+    }
+
+    return parsed.toLocaleString();
+  }
+
+  function clearUxMetrics() {
+    setUxMetrics(defaultUxMetrics());
+  }
+
+  function clearAuthTimeline() {
+    setAuthTimeline([]);
+  }
+
+  const hasReader = readerStatus.length > 0;
+  const hasCardPresent = readerStatus.some((reader) => reader.cardPresent);
+  const canStartAuthentication = status === "Connected" && sessionUpdate.connected;
+  const latestAuthTimelineEntry = authTimeline[0] ?? null;
   const showPinModal = sessionUpdate.sessionId && sessionUpdate.state === "PIN_ENTRY";
-  const lifecycleState = lifecycleStateLabel();
+  const authTone = primaryStatusTone();
+  const onboardingVisible = !onboardingComplete;
+  const onboardingChecklist: Array<{
+    id: "service" | "reader" | "card" | "auth";
+    label: string;
+    done: boolean;
+    hint: string;
+  }> = [
+    {
+      id: "service",
+      label: "OpenAusweis is ready",
+      done: onboardingStepState("service") === "done",
+      hint: onboardingStepHint("service"),
+    },
+    {
+      id: "reader",
+      label: "A card reader is detected",
+      done: onboardingStepState("reader") === "done",
+      hint: onboardingStepHint("reader"),
+    },
+    {
+      id: "card",
+      label: "Your ID card is inserted",
+      done: onboardingStepState("card") === "done",
+      hint: onboardingStepHint("card"),
+    },
+    {
+      id: "auth",
+      label: "Complete your first sign-in",
+      done: onboardingStepState("auth") === "done",
+      hint: onboardingStepHint("auth"),
+    },
+  ];
+  const nextOnboardingStep = onboardingChecklist.find((step) => !step.done) ?? null;
 
   return (
     <main className="app-shell">
-      <section className="card">
-        <div className="top-row">
+      <p className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+        {uiAnnouncement}
+      </p>
+      <section className="card" aria-label="OpenAusweis main application">
+        <header className="top-row">
           <div>
+            <p className="eyebrow">Secure identity companion</p>
             <h1>OpenAusweis</h1>
-            <p className="subtitle">Linux-native German eID desktop companion</p>
+            <p className="subtitle">Calm, private sign-in with your German eID card.</p>
           </div>
-          <div className="theme-controls" role="group" aria-label="Theme selection">
-            <button
-              type="button"
-              className={themePreference === "system" ? "secondary theme-button active" : "secondary theme-button"}
-              onClick={() => setThemePreference("system")}
-            >
-              System
-            </button>
-            <button
-              type="button"
-              className={themePreference === "light" ? "secondary theme-button active" : "secondary theme-button"}
-              onClick={() => setThemePreference("light")}
-            >
-              Light
-            </button>
-            <button
-              type="button"
-              className={themePreference === "dark" ? "secondary theme-button active" : "secondary theme-button"}
-              onClick={() => setThemePreference("dark")}
-            >
-              Dark
-            </button>
-          </div>
-        </div>
+        </header>
 
-        <div className="status-row">
-          <span className="label">Daemon</span>
-          <span className="value">{status}</span>
-        </div>
-        <p className="subtitle">{details}</p>
-        <div className={`lifecycle-banner lifecycle-${lifecycleState.tone}`} role="status" aria-live="polite">
-          <strong>Lifecycle:</strong> {lifecycleState.label}
-        </div>
-
-        <div className="actions">
-          <button onClick={handleProbeDaemon} disabled={probeInFlight}>
-            {probeInFlight ? "Probing..." : "Probe daemon"}
-          </button>
-          <button className="secondary" onClick={loadPolicy}>Reload policy</button>
-        </div>
-
-        <section className="session-panel">
-          <h2>Authentication Session</h2>
-          <div className="status-row session-row">
-            <span className="label">Stream</span>
-            <span className={sessionUpdate.connected ? "value good" : "value bad"}>
-              {sessionUpdate.connected ? "Connected" : "Disconnected"}
-            </span>
-          </div>
-          <p className="subtitle">
-            State: {sessionUpdate.state ?? "IDLE"}
-            {sessionUpdate.sessionId ? ` | Session: ${sessionUpdate.sessionId}` : ""}
-          </p>
-          <p className="subtitle session-hint">{sessionStateHint()}</p>
-          {sessionUpdate.sessionId ? (
-            <div className="actions">
-              <button className="secondary" onClick={handleCancelActiveSession}>
-                Cancel session
-              </button>
-            </div>
-          ) : (
-            <div className="actions">
-              <button className="secondary" onClick={handleStartTestSession}>
-                Start test session
-              </button>
-            </div>
-          )}
-          {sessionUpdate.error ? <p className="reader-error">{sessionUpdate.error}</p> : null}
-          {sessionResultMessage ? (
-            <p className="session-result">
-              {sessionResultMessage}
-              {sessionCompletedAt ? ` (${sessionCompletedAt})` : ""}
-            </p>
-          ) : null}
+        <section className="trust-strip" aria-label="Security trust indicators">
+          <span className="trust-badge">Local-only processing</span>
+          <span className="trust-badge">No cloud storage</span>
+          <span className="trust-badge">Official eID integration</span>
         </section>
 
-        <section className="device-panel">
-          <h2>Reader and Card Status</h2>
-          <div className="actions diagnostics-actions">
-            <button className="secondary" onClick={runDiagnostics}>Run diagnostics</button>
-          </div>
-          {lastDiagnosticsRunAt ? (
-            <p className="subtitle subtle-note">Last diagnostics run: {lastDiagnosticsRunAt}</p>
-          ) : null}
-          {readerStatus.length === 0 ? (
-            <p className="subtitle">No PC/SC readers detected.</p>
-          ) : (
-            <ul className="device-list">
-              {readerStatus.map((reader) => (
-                <li key={reader.name}>
-                  <span className="reader-name">{reader.name}</span>
-                  <span className={reader.cardPresent ? "badge present" : "badge absent"}>
-                    {reader.cardPresent ? "Card present" : "No card"}
-                  </span>
-                  {reader.error ? <p className="reader-error">{reader.error}</p> : null}
+        <section className="view-switch" role="tablist" aria-label="Primary and advanced views">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={activeView === "home"}
+            className={activeView === "home" ? "secondary nav-button active" : "secondary nav-button"}
+            onClick={() => setActiveView("home")}
+          >
+            Home
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={activeView === "advanced"}
+            className={activeView === "advanced" ? "secondary nav-button active" : "secondary nav-button"}
+            onClick={() => setActiveView("advanced")}
+          >
+            Advanced
+          </button>
+        </section>
+
+        {activeView === "home" ? (
+          <section aria-label="Sign-in home">
+            {onboardingVisible ? (
+              <section className="onboarding-card" aria-label="First-run onboarding">
+                <h2>Before your first sign-in</h2>
+                <p className="subtitle">Complete these steps once. OpenAusweis stays available from the tray afterward.</p>
+                <ul className="onboarding-list">
+                  {onboardingChecklist.map((step) => (
+                    <li key={step.id} className={step.done ? "onboarding-step done" : "onboarding-step"}>
+                      <p className="onboarding-step-row">{step.done ? "Done" : "To do"} - {step.label}</p>
+                      <p className="onboarding-hint">{step.hint}</p>
+                    </li>
+                  ))}
+                </ul>
+                {nextOnboardingStep ? (
+                  <p className="onboarding-next" role="status" aria-live="polite">
+                    Next required step: {nextOnboardingStep.label}
+                  </p>
+                ) : null}
+                <div className="actions">
+                  <button className="secondary" onClick={handleProbeDaemon} disabled={probeInFlight}>
+                    {probeInFlight ? "Checking..." : "Refresh setup status"}
+                  </button>
+                  {!sessionUpdate.sessionId && canStartAuthentication ? (
+                    <button type="button" onClick={handleStartBrowserAuthentication}>
+                      Start first sign-in
+                    </button>
+                  ) : null}
+                  <button
+                    type="button"
+                    className="secondary"
+                    onClick={() => {
+                      setOnboardingComplete(true);
+                      setUxMetrics((previous) => ({
+                        ...previous,
+                        onboardingCompletedCount: previous.onboardingCompletedCount + 1,
+                      }));
+                    }}
+                  >
+                    Hide onboarding
+                  </button>
+                </div>
+              </section>
+            ) : (
+              <div className="onboarding-compact">
+                <span>Onboarding hidden.</span>
+                <button type="button" className="secondary" onClick={() => setOnboardingComplete(false)}>
+                  Show setup checklist
+                </button>
+              </div>
+            )}
+
+            <section className={`status-hero tone-${authTone}`} aria-live="polite">
+              <p className="status-kicker">Current status</p>
+              <h2>{primaryStatusLabel()}</h2>
+              <p className="subtitle">{sessionStateHint()}</p>
+              <ul className="readiness-strip" aria-label="Readiness overview">
+                <li className={status === "Connected" ? "readiness-chip ok" : "readiness-chip warn"}>
+                  App: {status === "Connected" ? "Ready" : "Reconnecting"}
                 </li>
-              ))}
-            </ul>
-          )}
-          {status === "Connected" && pcscAvailable && readerStatus.length === 0 ? (
-            <div className="hotplug-guide">
-              <button
-                className="hotplug-toggle"
-                onClick={() => setHotplugOpen((prev) => !prev)}
-                aria-expanded={hotplugOpen}
-              >
-                {hotplugOpen ? "▾" : "▸"} First-run reader troubleshooting
-              </button>
-              {hotplugOpen ? (
-                <ol className="hotplug-checklist">
-                  <li className="hotplug-step">
-                    <strong>Check the USB cable.</strong> Unplug and re-plug the reader; try a different port or cable.
-                  </li>
-                  <li className="hotplug-step">
-                    <strong>Verify pcscd is running.</strong>{" "}
-                    <code>systemctl status pcscd</code> — start it with{" "}
-                    <code>sudo systemctl start pcscd</code> if stopped.
-                  </li>
-                  <li className="hotplug-step">
-                    <strong>Check USB device permissions.</strong>{" "}
-                    <code>ls -l /dev/bus/usb/**/*</code> — pcscd must be able to open the device. Check udev rules if access is denied.
-                  </li>
-                  <li className="hotplug-step">
-                    <strong>Scan for readers from the terminal.</strong>{" "}
-                    Run <code>pcsc_scan</code> (install via <code>sudo apt install pcscd pcsc-tools</code>). It should list your reader within a few seconds of plugging in.
-                  </li>
-                  <li className="hotplug-step">
-                    <strong>Try "Run diagnostics"</strong> above after attaching the reader to refresh the status here.
-                  </li>
-                </ol>
-              ) : null}
-            </div>
-          ) : null}
-          {diagnostics.length > 0 ? (
-            <>
-              <h3>Diagnostics</h3>
-              <ul className="diagnostics-list">
-                {diagnostics.map((line, index) => (
-                  <li key={`${line}-${index}`}>{line}</li>
-                ))}
+                <li className={hasReader ? "readiness-chip ok" : "readiness-chip warn"}>
+                  Reader: {hasReader ? "Detected" : "Not detected"}
+                </li>
+                <li className={hasCardPresent ? "readiness-chip ok" : "readiness-chip warn"}>
+                  Card: {hasCardPresent ? "Inserted" : "Not inserted"}
+                </li>
               </ul>
-            </>
-          ) : null}
-          {ipcDiagnostics ? (
-            <div className="ipc-diagnostics">
-              <h3>IPC Metrics</h3>
-              <div className="metrics-grid">
-                <div className="metric">
-                  <span className="metric-label">Requests</span>
-                  <span className="metric-value">{ipcDiagnostics.requestCount}</span>
-                </div>
-                <div className="metric">
-                  <span className="metric-label">Errors</span>
-                  <span className="metric-value error">{ipcDiagnostics.errorCount}</span>
-                </div>
-                <div className="metric">
-                  <span className="metric-label">Validation Rejections</span>
-                  <span className="metric-value error">{ipcDiagnostics.validationRejections}</span>
-                </div>
-                <div className="metric">
-                  <span className="metric-label">Connection Failures</span>
-                  <span className="metric-value error">{ipcDiagnostics.connectionFailures}</span>
+              <div className="actions hero-actions">
+                {sessionUpdate.sessionId ? (
+                  <button className="secondary" onClick={handleCancelActiveSession}>
+                    Cancel sign-in
+                  </button>
+                ) : (
+                  <button onClick={handleStartBrowserAuthentication} disabled={!canStartAuthentication}>
+                    Start sign-in
+                  </button>
+                )}
+                <button className="secondary" onClick={handleProbeDaemon} disabled={probeInFlight}>
+                  {probeInFlight ? "Checking..." : "Refresh status"}
+                </button>
+              </div>
+              {!canStartAuthentication ? (
+                <p className="subtle-note">OpenAusweis is reconnecting. Sign-in will be available in a moment.</p>
+              ) : null}
+            </section>
+
+            <section className="session-panel">
+              <h2>Current sign-in</h2>
+              <div className="request-card" role="status" aria-live="polite">
+                <p className="request-title">{currentRequestTitle()}</p>
+                <div className="status-row session-row">
+                  <span className="label">Sign-in progress</span>
+                  <span className="value">{handoffStatusLabelFromState(Boolean(sessionUpdate.sessionId), sessionUpdate.state)}</span>
                 </div>
               </div>
-            </div>
-          ) : null}
-        </section>
+              <div className="next-action-panel" role="status" aria-live="polite">
+                <span className="label">What to do now</span>
+                <p className="next-action-text">{currentRequestActionHint()}</p>
+                {!sessionUpdate.sessionId ? (
+                  <p className="subtitle">Select "Start sign-in" when your reader and card are ready.</p>
+                ) : null}
+                {sessionUpdate.state === "ERROR" ? (
+                  <div className="actions error-recovery-actions">
+                    <button
+                      type="button"
+                      onClick={handleStartBrowserAuthentication}
+                      disabled={!canStartAuthentication}
+                    >
+                      Start again
+                    </button>
+                  </div>
+                ) : null}
+              </div>
+              {sessionUpdate.error ? (
+                <p className="reader-error" role="alert">{readableSessionError(sessionUpdate.error)}</p>
+              ) : null}
+              {sessionResultMessage ? (
+                <p className="session-result">
+                  {sessionResultMessage}
+                  {sessionCompletedAt ? ` (${sessionCompletedAt})` : ""}
+                </p>
+              ) : null}
 
-        <section className="policy-panel">
-          <h2>Origin Policy</h2>
-          <p className="subtitle">Edit trusted relying-party origins and domain suffixes.</p>
+              <div className="recent-activity-compact" role="status" aria-live="polite">
+                <span className="label">Last activity</span>
+                {latestAuthTimelineEntry ? (
+                  <span className="value">
+                    {latestAuthTimelineEntry.stage} - {latestAuthTimelineEntry.message} ({formatTimestamp(latestAuthTimelineEntry.at)})
+                  </span>
+                ) : (
+                  <span className="subtitle">No sign-in activity yet.</span>
+                )}
+              </div>
+            </section>
 
-          <label className="field-label" htmlFor="exact-origins">Allowed exact origins</label>
-          <textarea
-            id="exact-origins"
-            value={exactOriginsInput}
-            onChange={(event) => setExactOriginsInput(event.target.value)}
-            placeholder="https://service.example.de"
-          />
-
-          <label className="field-label" htmlFor="domain-suffixes">Allowed domain suffixes</label>
-          <textarea
-            id="domain-suffixes"
-            value={suffixesInput}
-            onChange={(event) => setSuffixesInput(event.target.value)}
-            placeholder=".bundid.de"
-          />
-
-          <div className="actions">
-            <button onClick={savePolicy}>Save policy</button>
-          </div>
-
-          <p className="subtitle">{policyState}</p>
-        </section>
-
-        {runtimeContext ? (
-          <section className="runtime-panel">
-            <h2>Desktop Runtime</h2>
-            <p className="subtitle">
-              Desktop: {runtimeContext.desktopEnv ?? "unknown"} | Session: {runtimeContext.sessionType ?? "unknown"}
-            </p>
-            <p className="subtitle">Tray strategy: {runtimeContext.trayStrategy}</p>
-            {runtimeContext.notes.length > 0 ? (
-              <ul className="diagnostics-list">
-                {runtimeContext.notes.map((note, index) => (
-                  <li key={`${note}-${index}`}>{note}</li>
-                ))}
-              </ul>
-            ) : null}
+            <section className="status-grid" aria-label="Card and tray overview">
+              <article className="status-tile">
+                <h3>Card reader</h3>
+                <p className="value">{hasReader ? "Detected" : "Not detected"}</p>
+                <p className="subtitle">{hasReader ? `${readerStatus.length} reader(s) available` : "Connect your USB card reader"}</p>
+              </article>
+              <article className="status-tile">
+                <h3>ID card</h3>
+                <p className="value">{hasCardPresent ? "Inserted" : "Not inserted"}</p>
+                <p className="subtitle">{hasCardPresent ? "Ready for sign-in" : "Insert card before starting sign-in"}</p>
+              </article>
+              <article className="status-tile">
+                <h3>Tray mode</h3>
+                <p className="value">Always on</p>
+                <p className="subtitle">Closing this window keeps OpenAusweis available from the system tray.</p>
+                <button type="button" className="secondary" onClick={handleHideWindowToTray}>
+                  Hide window to tray
+                </button>
+                {trayActionMessage ? <p className="tray-note">{trayActionMessage}</p> : null}
+              </article>
+              <article className="status-tile">
+                <h3>Linux environment</h3>
+                <p className="value">{linuxRuntimeHeadline()}</p>
+                <p className="subtitle runtime-note">{linuxRuntimeHint()}</p>
+                <button type="button" className="secondary" onClick={() => setActiveView("advanced")}>
+                  Open advanced runtime details
+                </button>
+              </article>
+            </section>
           </section>
-        ) : null}
+        ) : (
+          <section className="advanced-panel" aria-label="Advanced tools and diagnostics">
+            <h2>Advanced tools</h2>
+            <p className="subtitle">Technical details and troubleshooting are available here to keep the Home view calm.</p>
+
+            <section className="device-panel">
+              <h3>Reader and card details</h3>
+              <div className="actions diagnostics-actions">
+                <button className="secondary" onClick={runDiagnostics}>Run diagnostics</button>
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => setDiagnosticsDrawerOpen((previous) => !previous)}
+                  aria-expanded={diagnosticsDrawerOpen}
+                >
+                  {diagnosticsDrawerOpen ? "Hide diagnostics drawer" : "Show diagnostics drawer"}
+                </button>
+                <button
+                  type="button"
+                  className={developerModeEnabled ? "secondary active-toggle" : "secondary"}
+                  onClick={() => setDeveloperModeEnabled((previous) => !previous)}
+                  aria-pressed={developerModeEnabled}
+                >
+                  {developerModeEnabled ? "Developer mode: on" : "Developer mode: off"}
+                </button>
+              </div>
+              {lastDiagnosticsRunAt ? <p className="subtitle subtle-note">Last diagnostics run: {lastDiagnosticsRunAt}</p> : null}
+              {readerStatus.length === 0 ? (
+                <p className="subtitle">No readers detected.</p>
+              ) : (
+                <ul className="device-list">
+                  {readerStatus.map((reader) => (
+                    <li key={reader.name}>
+                      <span className="reader-name">{reader.name}</span>
+                      <span className={reader.cardPresent ? "badge present" : "badge absent"}>
+                        {reader.cardPresent ? "Card present" : "No card"}
+                      </span>
+                      {reader.error ? <p className="reader-error">{reader.error}</p> : null}
+                    </li>
+                  ))}
+                </ul>
+              )}
+
+              {status === "Connected" && pcscAvailable && readerStatus.length === 0 ? (
+                <div className="hotplug-guide">
+                  <button
+                    className="hotplug-toggle"
+                    onClick={() => setHotplugOpen((prev) => !prev)}
+                    aria-expanded={hotplugOpen}
+                  >
+                    {hotplugOpen ? "▾" : "▸"} Reader troubleshooting
+                  </button>
+                  {hotplugOpen ? (
+                    <ol className="hotplug-checklist">
+                      <li className="hotplug-step">
+                        <strong>Check cable and USB port.</strong> Reconnect the reader and try another port.
+                      </li>
+                      <li className="hotplug-step">
+                        <strong>Check smartcard service.</strong> Run <code>systemctl status pcscd</code> and start with <code>sudo systemctl start pcscd</code> if needed.
+                      </li>
+                      <li className="hotplug-step">
+                        <strong>Run terminal scan.</strong> Use <code>pcsc_scan</code> to verify reader detection.
+                      </li>
+                      <li className="hotplug-step">
+                        <strong>Refresh diagnostics.</strong> Use the button above after reconnecting devices.
+                      </li>
+                    </ol>
+                  ) : null}
+                </div>
+              ) : null}
+
+              {diagnosticsDrawerOpen ? (
+                <div className="diagnostics-drawer" role="region" aria-label="Diagnostics drawer">
+                  <h3>Diagnostics drawer</h3>
+                  <p className="subtitle">
+                    {developerModeEnabled
+                      ? "Developer mode is active. Detailed diagnostic output is visible below."
+                      : "Developer mode is off. Turn it on to see detailed diagnostic output and telemetry."}
+                  </p>
+
+                  {developerModeEnabled && diagnostics.length > 0 ? (
+                    <>
+                      <h4>Diagnostics output</h4>
+                      <ul className="diagnostics-list">
+                        {diagnostics.map((line, index) => (
+                          <li key={`${line}-${index}`}>{line}</li>
+                        ))}
+                      </ul>
+                    </>
+                  ) : null}
+
+                  {developerModeEnabled && ipcDiagnostics ? (
+                    <div className="ipc-diagnostics">
+                      <h4>Connection metrics</h4>
+                      <div className="metrics-grid">
+                        <div className="metric">
+                          <span className="metric-label">Requests</span>
+                          <span className="metric-value">{ipcDiagnostics.requestCount}</span>
+                        </div>
+                        <div className="metric">
+                          <span className="metric-label">Errors</span>
+                          <span className="metric-value error">{ipcDiagnostics.errorCount}</span>
+                        </div>
+                        <div className="metric">
+                          <span className="metric-label">Validation rejections</span>
+                          <span className="metric-value error">{ipcDiagnostics.validationRejections}</span>
+                        </div>
+                        <div className="metric">
+                          <span className="metric-label">Connection failures</span>
+                          <span className="metric-value error">{ipcDiagnostics.connectionFailures}</span>
+                        </div>
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+            </section>
+
+            <section className="policy-panel">
+              <h3>Trusted website policy</h3>
+              <p className="subtitle">Manage allowed relying-party origins and domain suffixes.</p>
+              <div className="actions">
+                <button className="secondary" onClick={loadPolicy}>Reload policy</button>
+              </div>
+
+              <label className="field-label" htmlFor="exact-origins">Allowed exact origins</label>
+              <textarea
+                id="exact-origins"
+                value={exactOriginsInput}
+                onChange={(event) => setExactOriginsInput(event.target.value)}
+                placeholder="https://service.example.de"
+              />
+
+              <label className="field-label" htmlFor="domain-suffixes">Allowed domain suffixes</label>
+              <textarea
+                id="domain-suffixes"
+                value={suffixesInput}
+                onChange={(event) => setSuffixesInput(event.target.value)}
+                placeholder=".bundid.de"
+              />
+
+              <label className="field-label" htmlFor="preferred-relying-party">Preferred relying-party origin</label>
+              <input
+                id="preferred-relying-party"
+                className="pin-input"
+                type="text"
+                value={preferredRelyingParty}
+                onChange={(event) => setPreferredRelyingParty(event.target.value.trim())}
+                placeholder="https://service.example.de"
+              />
+
+              <div className="actions">
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => {
+                    const suggestions = exactOriginsInput
+                      .split("\n")
+                      .map((value) => value.trim())
+                      .filter((value) => value.length > 0);
+                    setPreferredRelyingParty(preferredRelyingPartyFromOrigins(suggestions));
+                  }}
+                >
+                  Use recommended origin
+                </button>
+              </div>
+
+              <div className="actions">
+                <button onClick={savePolicy}>Save policy</button>
+              </div>
+              <p className="subtitle">{policyState}</p>
+            </section>
+
+            <section className="history-panel" aria-label="Sign-in history">
+              <h3>Sign-in history</h3>
+              <p className="subtitle">Recent sign-in events on this device.</p>
+              {authTimeline.length === 0 ? (
+                <p className="subtitle">No sign-in activity yet.</p>
+              ) : (
+                <ul className="diagnostics-list">
+                  {authTimeline.map((entry) => (
+                    <li key={entry.id}>
+                      <strong>{entry.stage}</strong> - {entry.message} ({formatTimestamp(entry.at)})
+                    </li>
+                  ))}
+                </ul>
+              )}
+              <div className="actions">
+                <button type="button" className="secondary" onClick={clearAuthTimeline}>
+                  Clear activity timeline
+                </button>
+              </div>
+            </section>
+
+            <section className="runtime-panel">
+              <h3>Desktop behavior</h3>
+              <div className="status-grid compact">
+                <article className="status-tile">
+                  <h4>Accessibility</h4>
+                  <p className="subtitle">Use stronger contrast for readability.</p>
+                  <button type="button" className="secondary" onClick={() => setHighContrast((prev) => !prev)}>
+                    {highContrast ? "Disable high contrast" : "Enable high contrast"}
+                  </button>
+                </article>
+                <article className="status-tile">
+                  <h4>Theme</h4>
+                  <p className="subtitle">Current theme: {themePreference}</p>
+                  <p className="subtitle">Resolved mode: {resolvedTheme}</p>
+                  <div className="theme-controls" role="group" aria-label="Theme selection">
+                    <button
+                      type="button"
+                      className={themePreference === "system" ? "secondary theme-button active" : "secondary theme-button"}
+                      onClick={() => setThemePreference("system")}
+                    >
+                      System
+                    </button>
+                    <button
+                      type="button"
+                      className={themePreference === "light" ? "secondary theme-button active" : "secondary theme-button"}
+                      onClick={() => setThemePreference("light")}
+                    >
+                      Light
+                    </button>
+                    <button
+                      type="button"
+                      className={themePreference === "dark" ? "secondary theme-button active" : "secondary theme-button"}
+                      onClick={() => setThemePreference("dark")}
+                    >
+                      Dark
+                    </button>
+                  </div>
+                </article>
+                {runtimeContext ? (
+                  <article className="status-tile">
+                    <h4>Linux runtime</h4>
+                    <p className="subtitle">Desktop: {runtimeContext.desktopEnv ?? "unknown"}</p>
+                    <p className="subtitle">Session type: {runtimeContext.sessionType ?? "unknown"}</p>
+                    <p className="subtitle">Tray strategy: {runtimeContext.trayStrategy}</p>
+                  </article>
+                ) : null}
+                <article className="status-tile">
+                  <h4>UX insights (local only)</h4>
+                  <p className="subtitle">Onboarding completed: {uxMetrics.onboardingCompletedCount}</p>
+                  <p className="subtitle">Auth started: {uxMetrics.authStartedCount}</p>
+                  <p className="subtitle">PIN prompts: {uxMetrics.pinPromptCount}</p>
+                  <p className="subtitle">Auth completed: {uxMetrics.authCompletedCount}</p>
+                  <p className="subtitle">Auth failed: {uxMetrics.authFailedCount}</p>
+                  <p className="subtitle">Auth cancelled: {uxMetrics.authCancelledCount}</p>
+                  <p className="subtitle">Last start: {formatTimestamp(uxMetrics.lastAuthStartedAt)}</p>
+                  <p className="subtitle">Last complete: {formatTimestamp(uxMetrics.lastAuthCompletedAt)}</p>
+                  <p className="subtitle">Last failure: {formatTimestamp(uxMetrics.lastAuthFailedAt)}</p>
+                  <button type="button" className="secondary" onClick={clearUxMetrics}>
+                    Clear local insights
+                  </button>
+                </article>
+              </div>
+              {runtimeContext?.notes.length ? (
+                <ul className="diagnostics-list">
+                  {runtimeContext.notes.map((note, index) => (
+                    <li key={`${note}-${index}`}>{note}</li>
+                  ))}
+                </ul>
+              ) : null}
+            </section>
+          </section>
+        )}
       </section>
 
       {showPinModal ? (
         <div className="modal-backdrop" role="presentation">
           <section className="pin-modal" role="dialog" aria-modal="true" aria-label="Enter eID PIN">
             <h2>Enter eID PIN</h2>
-            <p className="subtitle">Session {sessionUpdate.sessionId}</p>
-            <label className="field-label" htmlFor="pin-input">PIN (6 digits)</label>
-            <input
-              id="pin-input"
-              className="pin-input"
-              type="password"
-              value={pinInput}
-              inputMode="numeric"
-              maxLength={6}
-              autoFocus
-              onChange={(event) => setPinInput(event.target.value.replace(/\D+/g, ""))}
-              placeholder="******"
-            />
-            {pinError ? <p className="reader-error">{pinError}</p> : null}
-            <div className="actions">
-              <button onClick={handleSubmitPin} disabled={submitPinBusy || pinInput.length !== 6}>
-                {submitPinBusy ? "Submitting..." : "Submit PIN"}
-              </button>
-              <button className="secondary" onClick={handleCancelActiveSession} disabled={submitPinBusy}>
-                Cancel
-              </button>
-            </div>
+            <p className="subtitle" id="pin-modal-context">Confirm your sign-in with your card PIN.</p>
+            <p className="subtitle" id="pin-modal-help">Use your 6-digit card PIN.</p>
+            <form
+              onSubmit={(event) => {
+                event.preventDefault();
+                void handleSubmitPin();
+              }}
+            >
+              <label className="field-label" htmlFor="pin-input">PIN (6 digits)</label>
+              <input
+                id="pin-input"
+                className="pin-input"
+                type="password"
+                value={pinInput}
+                inputMode="numeric"
+                maxLength={6}
+                autoFocus
+                aria-describedby={pinError ? "pin-modal-help pin-modal-error" : "pin-modal-help"}
+                aria-invalid={pinError ? "true" : "false"}
+                onChange={(event) => setPinInput(event.target.value.replace(/\D+/g, ""))}
+                placeholder="******"
+              />
+              {pinError ? <p className="reader-error" id="pin-modal-error">{pinError}</p> : null}
+              <div className="actions">
+                <button type="submit" disabled={submitPinBusy || pinInput.length !== 6}>
+                  {submitPinBusy ? "Submitting..." : "Submit PIN"}
+                </button>
+                <button type="button" className="secondary" onClick={handleCancelActiveSession} disabled={submitPinBusy}>
+                  Cancel
+                </button>
+              </div>
+            </form>
           </section>
         </div>
       ) : null}
