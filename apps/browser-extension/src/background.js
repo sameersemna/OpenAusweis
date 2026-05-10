@@ -26,10 +26,24 @@ const bridgeMetrics = {
   updatedAt: null,
 };
 
+function getExtensionApi() {
+  if (typeof chrome !== "undefined" && chrome?.runtime) {
+    return chrome;
+  }
+
+  if (typeof browser !== "undefined" && browser?.runtime) {
+    return browser;
+  }
+
+  throw new Error("Browser extension runtime API is not available");
+}
+
+const EXT_API = getExtensionApi();
+
 const nativeClient = createNativeClient();
 
 function connectNativeHost() {
-  return chrome.runtime.connectNative(NATIVE_HOST);
+  return EXT_API.runtime.connectNative(NATIVE_HOST);
 }
 
 function createRequestId() {
@@ -73,6 +87,19 @@ function recordMetric(key, value = null) {
 
 function setLastBridgeError(error) {
   bridgeMetrics.lastError = String(error);
+  bridgeMetrics.updatedAt = new Date().toISOString();
+}
+
+function resetBridgeMetrics() {
+  bridgeMetrics.nativeDisconnects = 0;
+  bridgeMetrics.nativeTimeouts = 0;
+  bridgeMetrics.watchRetries = 0;
+  bridgeMetrics.daemonErrors = 0;
+  bridgeMetrics.sessionStarts = 0;
+  bridgeMetrics.sessionCompletions = 0;
+  bridgeMetrics.sessionGuardRejects = 0;
+  bridgeMetrics.waitAborts = 0;
+  bridgeMetrics.lastError = null;
   bridgeMetrics.updatedAt = new Date().toISOString();
 }
 
@@ -148,7 +175,7 @@ function createNativeClient() {
     });
 
     port.onDisconnect.addListener(() => {
-      const runtimeError = chrome.runtime.lastError;
+      const runtimeError = EXT_API.runtime.lastError;
       const message = runtimeError?.message || "Native host disconnected";
       const error = new Error(message);
       recordMetric("nativeDisconnects");
@@ -245,7 +272,7 @@ function isAllowedOrigin(origin, policy) {
 }
 
 async function getOriginPolicy() {
-  const stored = await chrome.storage.local.get(["allowedExactOrigins", "allowedSuffixes"]);
+  const stored = await EXT_API.storage.local.get(["allowedExactOrigins", "allowedSuffixes"]);
   const exactOrigins = Array.isArray(stored.allowedExactOrigins)
     ? stored.allowedExactOrigins.filter((value) => typeof value === "string")
     : DEFAULT_ALLOWED_EXACT_ORIGINS;
@@ -514,9 +541,15 @@ export {
   sessionWaitKey,
 };
 
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+EXT_API.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
     if (message?.type === "GET_BRIDGE_DIAGNOSTICS") {
+      sendResponse({ ok: true, diagnostics: { ...bridgeMetrics } });
+      return;
+    }
+
+    if (message?.type === "CLEAR_BRIDGE_DIAGNOSTICS") {
+      resetBridgeMetrics();
       sendResponse({ ok: true, diagnostics: { ...bridgeMetrics } });
       return;
     }

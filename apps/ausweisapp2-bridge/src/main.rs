@@ -457,7 +457,17 @@ mod tests {
         let address = listener.local_addr().expect("listener local_addr");
         let ws_url = format!("ws://{}/", address);
 
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+
         let task = tokio::spawn(async move {
+            // Signal that we are now polling accept() so the client knows it is
+            // safe to connect. The send happens-before accept() is polled, which
+            // is fine: the OS kernel has already placed the listener socket into
+            // LISTEN state (done by TcpListener::bind), so the client's TCP
+            // connect will succeed regardless. Explicitly signalling here
+            // avoids the parallel-test timing window that caused flaky failures.
+            let _ = ready_tx.send(());
+
             let (stream, _) = listener.accept().await.expect("accept mock websocket client");
             let mut ws = accept_async(stream).await.expect("upgrade websocket");
 
@@ -474,8 +484,8 @@ mod tests {
                 .expect("send websocket response");
         });
 
-        // Give the spawned task a chance to start polling accept() before client connect.
-        tokio::task::yield_now().await;
+        // Wait for the server task to reach its accept() poll before returning.
+        ready_rx.await.expect("mock server ready signal dropped");
 
         (ws_url, task)
     }

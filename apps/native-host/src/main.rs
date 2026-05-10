@@ -809,6 +809,55 @@ mod tests {
         result
     }
 
+    async fn with_mock_daemon_raw_line(
+        request: RpcEnvelope<ClientRequest>,
+        raw_line: Option<String>,
+    ) -> Result<RpcEnvelope<DaemonResponse>> {
+        let lock = TEST_SOCKET_ENV_LOCK.get_or_init(|| Mutex::new(()));
+        let _guard = lock.lock().expect("test socket env lock poisoned");
+
+        let socket_path = std::env::temp_dir().join(format!(
+            "openausweis-native-host-test-{}.sock",
+            Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&socket_path);
+
+        let previous_socket = std::env::var("OPENAUSWEIS_DAEMON_SOCKET").ok();
+        std::env::set_var("OPENAUSWEIS_DAEMON_SOCKET", socket_path.to_string_lossy().to_string());
+
+        let listener = UnixListener::bind(&socket_path).expect("bind mock daemon socket");
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept connection");
+            let (reader, mut writer) = stream.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            let _ = lines.next_line().await.expect("read request line");
+
+            if let Some(raw_line) = raw_line {
+                writer
+                    .write_all(raw_line.as_bytes())
+                    .await
+                    .expect("write mock response");
+                writer
+                    .write_all(b"\n")
+                    .await
+                    .expect("write mock response newline");
+            }
+        });
+
+        let result = forward_to_daemon(request).await;
+
+        let _ = server_task.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        if let Some(previous) = previous_socket {
+            std::env::set_var("OPENAUSWEIS_DAEMON_SOCKET", previous);
+        } else {
+            std::env::remove_var("OPENAUSWEIS_DAEMON_SOCKET");
+        }
+
+        result
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn forward_to_daemon_rejects_request_id_mismatch() {
         let request = RpcEnvelope::new(Uuid::new_v4(), ClientRequest::GetStatus);
@@ -832,6 +881,126 @@ mod tests {
             err.to_string().contains("request_id mismatch"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn forward_to_daemon_returns_status_for_non_watch_request() {
+        let request = RpcEnvelope::new(Uuid::new_v4(), ClientRequest::GetStatus);
+        let response = RpcEnvelope::new(
+            request.request_id,
+            DaemonResponse::Status(openausweis_ipc::DaemonStatus {
+                healthy: true,
+                pcsc_available: true,
+                active_session_count: 0,
+                readers: Vec::new(),
+                diagnostics: vec!["ok".to_string()],
+                last_error: None,
+                ipc_diagnostics: openausweis_ipc::IpcDiagnostics::default(),
+            }),
+        );
+
+        let forwarded = with_mock_daemon_response(request, Some(response), false)
+            .await
+            .expect("expected successful status passthrough");
+
+        match forwarded.payload {
+            DaemonResponse::Status(status) => {
+                assert!(status.healthy);
+                assert!(status.pcsc_available);
+                assert_eq!(status.active_session_count, 0);
+                assert_eq!(status.diagnostics, vec!["ok".to_string()]);
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn forward_to_daemon_watch_sessions_accepts_session_updated_first_event() {
+        let request = RpcEnvelope::new(
+            Uuid::new_v4(),
+            ClientRequest::WatchSessions { interval_ms: 500 },
+        );
+        let session_id = Uuid::new_v4();
+        let response = RpcEnvelope::new(
+            request.request_id,
+            DaemonResponse::SessionUpdated {
+                session_id,
+                state: openausweis_ipc::SessionState::PinEntry,
+                error: None,
+                handoff_id: Some("handoff-watch-ok".to_string()),
+            },
+        );
+
+        let forwarded = with_mock_daemon_response(request, Some(response), false)
+            .await
+            .expect("expected watch first-event acceptance");
+
+        match forwarded.payload {
+            DaemonResponse::SessionUpdated {
+                session_id: returned,
+                state,
+                handoff_id,
+                ..
+            } => {
+                assert_eq!(returned, session_id);
+                assert_eq!(state, openausweis_ipc::SessionState::PinEntry);
+                assert_eq!(handoff_id.as_deref(), Some("handoff-watch-ok"));
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn forward_to_daemon_watch_sessions_accepts_session_cancelled_first_event() {
+        let request = RpcEnvelope::new(
+            Uuid::new_v4(),
+            ClientRequest::WatchSessions { interval_ms: 500 },
+        );
+        let session_id = Uuid::new_v4();
+        let response = RpcEnvelope::new(
+            request.request_id,
+            DaemonResponse::SessionCancelled { session_id },
+        );
+
+        let forwarded = with_mock_daemon_response(request, Some(response), false)
+            .await
+            .expect("expected cancelled first-event acceptance");
+
+        match forwarded.payload {
+            DaemonResponse::SessionCancelled {
+                session_id: returned,
+            } => {
+                assert_eq!(returned, session_id);
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn forward_to_daemon_watch_sessions_accepts_error_first_event() {
+        let request = RpcEnvelope::new(
+            Uuid::new_v4(),
+            ClientRequest::WatchSessions { interval_ms: 500 },
+        );
+        let response = RpcEnvelope::new(
+            request.request_id,
+            DaemonResponse::Error {
+                code: "SESSION_NOT_FOUND".to_string(),
+                message: "session stream unavailable".to_string(),
+            },
+        );
+
+        let forwarded = with_mock_daemon_response(request, Some(response), false)
+            .await
+            .expect("expected error first-event acceptance");
+
+        match forwarded.payload {
+            DaemonResponse::Error { code, message } => {
+                assert_eq!(code, "SESSION_NOT_FOUND");
+                assert_eq!(message, "session stream unavailable");
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -874,6 +1043,33 @@ mod tests {
             .expect_err("expected watch timeout error");
         assert!(
             err.to_string().contains("timed out while waiting for session stream event"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn forward_to_daemon_rejects_malformed_daemon_response() {
+        let request = RpcEnvelope::new(Uuid::new_v4(), ClientRequest::GetStatus);
+
+        let err = with_mock_daemon_raw_line(request, Some("{not-json".to_string()))
+            .await
+            .expect_err("expected daemon parse error");
+        assert!(
+            err.to_string().contains("failed to parse daemon response"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn forward_to_daemon_errors_when_daemon_closes_without_response() {
+        let request = RpcEnvelope::new(Uuid::new_v4(), ClientRequest::GetStatus);
+
+        let err = with_mock_daemon_response(request, None, false)
+            .await
+            .expect_err("expected closed-connection error");
+        assert!(
+            err.to_string()
+                .contains("daemon closed connection before responding"),
             "unexpected error: {err}"
         );
     }

@@ -1,13 +1,12 @@
 {
-  "manifest_version": 3,
+  "manifest_version": 2,
   "name": "OpenAusweis Browser Connector",
   "version": "0.1.0",
   "description": "Connects websites to OpenAusweis native Linux daemon.",
-  "permissions": ["nativeMessaging", "storage", "activeTab"],
-  "host_permissions": ["https://*/*", "http://localhost/*"],
+  "permissions": ["nativeMessaging", "storage", "activeTab", "https://*/*", "http://localhost/*"],
   "background": {
-    "service_worker": "src/background.js",
-    "type": "module"
+    "scripts": ["src/background.v2-loader.js"],
+    "persistent": true
   },
   "content_scripts": [
     {
@@ -16,8 +15,14 @@
       "run_at": "document_idle"
     }
   ],
-  "action": {
+  "browser_action": {
     "default_title": "OpenAusweis",
     "default_popup": "src/popup.html"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "openausweis-browser@openausweis.org",
+      "strict_min_version": "109.0"
+    }
   }
 }

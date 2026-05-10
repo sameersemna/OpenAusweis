@@ -11,11 +11,30 @@
  *   updatedAt?: string | null }} BridgeDiagnostics
  */
 
+function getExtensionApi() {
+  if (typeof chrome !== "undefined" && chrome?.runtime) {
+    return chrome;
+  }
+
+  if (typeof browser !== "undefined" && browser?.runtime) {
+    return browser;
+  }
+
+  throw new Error("Browser extension runtime API is not available");
+}
+
+const EXT_API = getExtensionApi();
+
+/** @param {unknown} message @returns {Promise<any>} */
+function sendMessage(message) {
+  return EXT_API.runtime.sendMessage(message);
+}
+
 /** @returns {Promise<DaemonStatus | null>} */
 async function fetchStatus() {
   try {
     /** @type {{ ok: boolean, response?: DaemonPayload, error?: string }} */
-    const result = await chrome.runtime.sendMessage({ type: "GET_STATUS" });
+    const result = await sendMessage({ type: "GET_STATUS" });
     if (!result.ok || !result.response) {
       return null;
     }
@@ -32,7 +51,7 @@ async function fetchStatus() {
 /** @returns {Promise<BridgeDiagnostics | null>} */
 async function fetchBridgeDiagnostics() {
   try {
-    const result = await chrome.runtime.sendMessage({ type: "GET_BRIDGE_DIAGNOSTICS" });
+    const result = await sendMessage({ type: "GET_BRIDGE_DIAGNOSTICS" });
     if (!result?.ok || !result?.diagnostics) {
       return null;
     }
@@ -40,6 +59,28 @@ async function fetchBridgeDiagnostics() {
     return /** @type {BridgeDiagnostics} */ (result.diagnostics);
   } catch (_) {
     return null;
+  }
+}
+
+/** @returns {Promise<BridgeDiagnostics | null>} */
+async function clearBridgeDiagnostics() {
+  try {
+    const result = await sendMessage({ type: "CLEAR_BRIDGE_DIAGNOSTICS" });
+    if (!result?.ok || !result?.diagnostics) {
+      return null;
+    }
+
+    return /** @type {BridgeDiagnostics} */ (result.diagnostics);
+  } catch (_) {
+    return null;
+  }
+}
+
+/** @param {string} message */
+function updateLiveRegion(message) {
+  const live = document.getElementById("status-live");
+  if (live) {
+    live.textContent = message;
   }
 }
 
@@ -62,17 +103,54 @@ function renderStatus(status) {
   const body = /** @type {HTMLElement} */ (document.getElementById("body"));
   body.innerHTML = "";
 
-  body.append(makeRow("Daemon", "ok", "Connected"));
-  body.append(
+  const statusTitle = document.createElement("div");
+  statusTitle.className = "section-title";
+  statusTitle.textContent = "Status";
+  body.append(statusTitle);
+
+  const statusPanel = document.createElement("section");
+  statusPanel.className = "status-panel";
+  statusPanel.append(
+    makeRow("Daemon", status.healthy ? "ok" : "warn", status.healthy ? "Connected" : "Degraded")
+  );
+  statusPanel.append(
     makeRow(
       "PC/SC",
       status.pcscAvailable ? "ok" : "err",
       status.pcscAvailable ? "Available" : "Unavailable"
     )
   );
+  statusPanel.append(
+    makeRow(
+      "Sessions",
+      status.activeSessionCount > 0 ? "warn" : "ok",
+      status.activeSessionCount > 0 ? `${status.activeSessionCount} active` : "0 active"
+    )
+  );
+  body.append(statusPanel);
 
   if (status.activeSessionCount > 0) {
-    body.append(makeRow("Sessions", "warn", String(status.activeSessionCount)));
+    const sessionPanel = document.createElement("section");
+    sessionPanel.className = "session-panel";
+
+    const sessionTitle = document.createElement("div");
+    sessionTitle.className = "section-title";
+    sessionTitle.textContent = "Active Session";
+
+    const sessionCount = document.createElement("div");
+    sessionCount.className = "session-meta";
+    sessionCount.innerHTML =
+      '<span class="session-meta-label">Open sessions</span><span>' +
+      String(status.activeSessionCount) +
+      "</span>";
+
+    const sessionHint = document.createElement("div");
+    sessionHint.className = "hint-note";
+    sessionHint.textContent =
+      "Authentication is in progress. Keep this popup open to monitor connection health.";
+
+    sessionPanel.append(sessionTitle, sessionCount, sessionHint);
+    body.append(sessionPanel);
   }
 
   // Readers section
@@ -114,45 +192,85 @@ function renderStatus(status) {
     errNote.textContent = status.lastError;
     body.append(errNote);
   }
+
+  if (!status.pcscAvailable) {
+    const guide = document.createElement("section");
+    guide.className = "guide";
+    guide.innerHTML =
+      "<strong>PC/SC unavailable</strong>" +
+      "<span>Install and start pcscd, then refresh this popup.</span>";
+    body.append(guide);
+  }
+
+  updateLiveRegion(
+    `Daemon ${status.healthy ? "connected" : "degraded"}. ` +
+      `PCSC ${status.pcscAvailable ? "available" : "unavailable"}. ` +
+      `${status.activeSessionCount} active sessions.`
+  );
 }
 
 function renderDisconnected() {
   const body = /** @type {HTMLElement} */ (document.getElementById("body"));
   body.innerHTML = "";
   body.append(makeRow("Daemon", "err", "Disconnected"));
-  const note = document.createElement("div");
-  note.className = "hint-note";
-  note.textContent =
-    "Cannot reach the OpenAusweis daemon. " +
-    "Ensure the native messaging host is installed and the daemon is running.";
-  body.append(note);
+  const guide = document.createElement("section");
+  guide.className = "guide";
+  guide.innerHTML =
+    "<strong>Daemon unavailable</strong>" +
+    "<span>Run ./scripts/run-daemon.sh, then click refresh.</span>";
+  body.append(guide);
+  updateLiveRegion("Daemon disconnected");
 }
 
 /** @param {BridgeDiagnostics} diagnostics */
 function renderBridgeDiagnostics(diagnostics) {
   const body = /** @type {HTMLElement} */ (document.getElementById("body"));
-  const section = document.createElement("div");
-  section.className = "readers-section";
+  const details = document.createElement("details");
+  details.className = "diag";
 
-  const sectionLabel = document.createElement("div");
-  sectionLabel.className = "label";
-  sectionLabel.textContent = "Bridge Diagnostics";
-  section.append(sectionLabel);
+  const summary = document.createElement("summary");
+  summary.setAttribute("role", "button");
+  summary.setAttribute("aria-label", "Toggle bridge diagnostics");
+  summary.innerHTML = '<span class="section-title">Bridge Diagnostics</span><span>Toggle</span>';
+  details.append(summary);
 
-  section.append(makeRow("Session starts", "ok", String(diagnostics.sessionStarts)));
-  section.append(makeRow("Completions", "ok", String(diagnostics.sessionCompletions)));
-  section.append(makeRow("Watch retries", "warn", String(diagnostics.watchRetries)));
-  section.append(makeRow("Native timeouts", "warn", String(diagnostics.nativeTimeouts)));
-  section.append(makeRow("Native disconnects", "warn", String(diagnostics.nativeDisconnects)));
+  const diagBody = document.createElement("div");
+  diagBody.className = "diag-body";
+  diagBody.append(makeRow("Session starts", "ok", String(diagnostics.sessionStarts)));
+  diagBody.append(makeRow("Completions", "ok", String(diagnostics.sessionCompletions)));
+  diagBody.append(makeRow("Watch retries", "warn", String(diagnostics.watchRetries)));
+  diagBody.append(makeRow("Native timeouts", "warn", String(diagnostics.nativeTimeouts)));
+  diagBody.append(makeRow("Native disconnects", "warn", String(diagnostics.nativeDisconnects)));
+  diagBody.append(makeRow("Validation errors", "warn", String(diagnostics.daemonErrors)));
+
+  if (diagnostics.updatedAt) {
+    const updatedAt = document.createElement("div");
+    updatedAt.className = "hint-note";
+    updatedAt.textContent = `Updated: ${diagnostics.updatedAt}`;
+    diagBody.append(updatedAt);
+  }
 
   if (diagnostics.lastError) {
     const errNote = document.createElement("div");
     errNote.className = "error-note";
     errNote.textContent = diagnostics.lastError;
-    section.append(errNote);
+    diagBody.append(errNote);
   }
 
-  body.append(section);
+  const controls = document.createElement("div");
+  controls.className = "diag-controls";
+  const clearButton = document.createElement("button");
+  clearButton.type = "button";
+  clearButton.textContent = "Clear metrics";
+  clearButton.addEventListener("click", async () => {
+    await clearBridgeDiagnostics();
+    await refresh();
+  });
+  controls.append(clearButton);
+  diagBody.append(controls);
+
+  details.append(diagBody);
+  body.append(details);
 }
 
 async function refresh() {

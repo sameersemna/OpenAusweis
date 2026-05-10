@@ -255,8 +255,37 @@ async fn handle_connection(
     let mut lines = BufReader::new(reader).lines();
 
     while let Some(line) = lines.next_line().await.context("failed to read line")? {
-        let request: RpcEnvelope<ClientRequest> =
-            serde_json::from_str(&line).context("invalid request json")?;
+        let request: RpcEnvelope<ClientRequest> = match serde_json::from_str(&line) {
+            Ok(request) => request,
+            Err(err) => {
+                let envelope = RpcEnvelope::new(
+                    uuid::Uuid::new_v4(),
+                    DaemonResponse::Error {
+                        code: "INVALID_REQUEST".to_string(),
+                        message: format!("invalid request json: {err}"),
+                    },
+                );
+
+                {
+                    let lock = DAEMON_DIAGNOSTICS.get_or_init(|| {
+                        Mutex::new(DaemonDiagnostics {
+                            requests: 0,
+                            errors: 0,
+                            validation_rejections: 0,
+                        })
+                    });
+                    let mut diag = lock.lock().expect("diagnostics lock poisoned");
+                    diag.incr_error();
+                    diag.incr_validation_rejection();
+                }
+
+                if let Err(write_err) = write_envelope(&mut writer, &envelope).await {
+                    info!(error = %write_err, "client closed while sending invalid request error");
+                    return Ok(());
+                }
+                continue;
+            }
+        };
 
         {
             let lock = DAEMON_DIAGNOSTICS.get_or_init(|| {
@@ -406,7 +435,10 @@ async fn stream_session_updates(
             },
         );
 
-        write_envelope(writer, &envelope).await?;
+        if let Err(err) = write_envelope(writer, &envelope).await {
+            info!(error = %err, "session watcher connection closed");
+            return Ok(());
+        }
     }
 
     loop {
@@ -804,6 +836,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_connection_recovers_after_invalid_json_line() {
+        let subsystem = MockCardSubsystem::from_snapshots(vec![sample_snapshot(false)]);
+        let executor = test_auth_executor();
+        let sessions = test_sessions();
+        let (client_stream, server_stream) = UnixStream::pair().expect("pair failed");
+
+        let server_task = tokio::spawn(async move {
+            handle_connection(server_stream, &subsystem, &executor, &sessions)
+                .await
+                .expect("handle_connection failed");
+        });
+
+        let (client_reader, mut client_writer) = client_stream.into_split();
+        client_writer
+            .write_all(b"{broken-json\n")
+            .await
+            .expect("write invalid line failed");
+
+        let request_id = uuid::Uuid::new_v4();
+        let valid_request = RpcEnvelope::new(request_id, ClientRequest::GetStatus);
+        let valid_line = serde_json::to_string(&valid_request).expect("serialize valid request");
+        client_writer
+            .write_all(valid_line.as_bytes())
+            .await
+            .expect("write valid line failed");
+        client_writer
+            .write_all(b"\n")
+            .await
+            .expect("write valid newline failed");
+        drop(client_writer);
+
+        let mut lines = BufReader::new(client_reader).lines();
+
+        let first_line = lines
+            .next_line()
+            .await
+            .expect("read first response failed")
+            .expect("missing first response");
+        let first_env: RpcEnvelope<DaemonResponse> =
+            serde_json::from_str(&first_line).expect("parse first response failed");
+        match first_env.payload {
+            DaemonResponse::Error { code, message } => {
+                assert_eq!(code, "INVALID_REQUEST");
+                assert!(message.contains("invalid request json"));
+            }
+            other => panic!("unexpected first payload: {other:?}"),
+        }
+
+        let second_line = lines
+            .next_line()
+            .await
+            .expect("read second response failed")
+            .expect("missing second response");
+        let second_env: RpcEnvelope<DaemonResponse> =
+            serde_json::from_str(&second_line).expect("parse second response failed");
+        assert_eq!(second_env.request_id, request_id);
+        assert!(matches!(second_env.payload, DaemonResponse::Status(_)));
+
+        server_task.await.expect("server task join failed");
+    }
+
+    #[tokio::test]
     async fn route_request_start_session_creates_active_session() {
         let subsystem = MockCardSubsystem::from_snapshots(vec![sample_snapshot(false)]);
         let executor = test_auth_executor();
@@ -1084,6 +1178,39 @@ mod tests {
         task.abort();
     }
 
+    #[tokio::test]
+    async fn watch_sessions_initial_write_handles_early_client_disconnect() {
+        let sessions = std::sync::Arc::new(SessionManager::new(StdDuration::from_secs(60)));
+        let snapshot = sessions
+            .start_session(
+                "https://localhost".to_string(),
+                Some("handoff-stream-disconnect".to_string()),
+            )
+            .expect("start session should succeed");
+
+        let (reader_stream, writer_stream) = UnixStream::pair().expect("pair failed");
+        drop(reader_stream);
+
+        let (_writer_reader, mut writer_half) = writer_stream.into_split();
+        let result = stream_session_updates(
+            uuid::Uuid::new_v4(),
+            WATCH_SESSIONS_MIN_INTERVAL_MS,
+            &sessions,
+            &mut writer_half,
+        )
+        .await;
+
+        assert!(result.is_ok(), "expected graceful disconnect handling");
+        assert_eq!(sessions.active_count(), 1);
+        assert_eq!(
+            sessions
+                .current_session()
+                .expect("session should remain")
+                .session_id,
+            snapshot.session_id
+        );
+    }
+
     #[test]
     fn should_log_pcsc_error_transition_only_on_change() {
         assert!(should_log_pcsc_error_transition(&None, &Some("x".to_string())));
@@ -1125,5 +1252,150 @@ mod tests {
             transitions, 3,
             "expected transitions: enter error, clear error, re-enter same error"
         );
+    }
+
+    #[tokio::test]
+    async fn route_request_cancel_session_not_found_returns_error() {
+        let subsystem = MockCardSubsystem::from_snapshots(vec![sample_snapshot(false)]);
+        let executor = test_auth_executor();
+        let sessions = test_sessions();
+        let phantom_id = uuid::Uuid::new_v4();
+
+        let response = route_request(
+            ClientRequest::CancelSession { session_id: phantom_id },
+            &subsystem,
+            &executor,
+            &sessions,
+        )
+        .await;
+
+        match response {
+            DaemonResponse::Error { code, message } => {
+                assert_eq!(code, "SESSION_NOT_FOUND");
+                assert!(message.contains(&phantom_id.to_string()));
+            }
+            other => panic!("expected SESSION_NOT_FOUND error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_connection_multiple_malformed_lines_each_get_error_response() {
+        let subsystem = MockCardSubsystem::from_snapshots(vec![sample_snapshot(false)]);
+        let executor = test_auth_executor();
+        let sessions = test_sessions();
+        let (client_stream, server_stream) = UnixStream::pair().expect("pair failed");
+
+        let server_task = tokio::spawn(async move {
+            handle_connection(server_stream, &subsystem, &executor, &sessions)
+                .await
+                .expect("handle_connection failed");
+        });
+
+        let (client_reader, mut client_writer) = client_stream.into_split();
+
+        // Send 3 malformed lines followed by 1 valid request
+        for _ in 0..3 {
+            client_writer
+                .write_all(b"not-valid-json\n")
+                .await
+                .expect("write malformed failed");
+        }
+        let valid_id = uuid::Uuid::new_v4();
+        let valid_req = RpcEnvelope::new(valid_id, ClientRequest::GetStatus);
+        let valid_line = serde_json::to_string(&valid_req).expect("serialize failed");
+        client_writer
+            .write_all(valid_line.as_bytes())
+            .await
+            .expect("write valid failed");
+        client_writer.write_all(b"\n").await.expect("write newline failed");
+        drop(client_writer);
+
+        let mut lines = BufReader::new(client_reader).lines();
+
+        // Expect 3 INVALID_REQUEST errors
+        for i in 0..3 {
+            let line = lines
+                .next_line()
+                .await
+                .expect("read error response failed")
+                .unwrap_or_else(|| panic!("missing error response {i}"));
+            let env: RpcEnvelope<DaemonResponse> =
+                serde_json::from_str(&line).expect("parse error envelope failed");
+            match env.payload {
+                DaemonResponse::Error { code, .. } => {
+                    assert_eq!(code, "INVALID_REQUEST", "line {i} should be INVALID_REQUEST");
+                }
+                other => panic!("expected INVALID_REQUEST for line {i}, got {other:?}"),
+            }
+        }
+
+        // Expect 1 valid Status response
+        let last_line = lines
+            .next_line()
+            .await
+            .expect("read valid response failed")
+            .expect("missing valid response");
+        let last_env: RpcEnvelope<DaemonResponse> =
+            serde_json::from_str(&last_line).expect("parse valid envelope failed");
+        assert_eq!(last_env.request_id, valid_id);
+        assert!(matches!(last_env.payload, DaemonResponse::Status(_)));
+
+        server_task.await.expect("server task join failed");
+    }
+
+    #[tokio::test]
+    async fn handle_connection_unsupported_protocol_does_not_close_connection() {
+        // Verifies that a bad-protocol-version message gets an error response
+        // but the connection stays alive and a subsequent valid request is served.
+        let subsystem = MockCardSubsystem::from_snapshots(vec![sample_snapshot(false)]);
+        let executor = test_auth_executor();
+        let sessions = test_sessions();
+        let (client_stream, server_stream) = UnixStream::pair().expect("pair failed");
+
+        let server_task = tokio::spawn(async move {
+            handle_connection(server_stream, &subsystem, &executor, &sessions)
+                .await
+                .expect("handle_connection failed");
+        });
+
+        let (client_reader, mut client_writer) = client_stream.into_split();
+
+        // Bad protocol version first
+        let bad_proto_id = uuid::Uuid::new_v4();
+        let bad_req = RpcEnvelope {
+            protocol_version: IPC_PROTOCOL_VERSION + 99,
+            request_id: bad_proto_id,
+            payload: ClientRequest::GetStatus,
+        };
+        let bad_line = serde_json::to_string(&bad_req).expect("serialize bad request");
+        client_writer.write_all(bad_line.as_bytes()).await.expect("write bad proto failed");
+        client_writer.write_all(b"\n").await.expect("write newline failed");
+
+        // Valid request immediately after
+        let good_id = uuid::Uuid::new_v4();
+        let good_req = RpcEnvelope::new(good_id, ClientRequest::GetStatus);
+        let good_line = serde_json::to_string(&good_req).expect("serialize good request");
+        client_writer.write_all(good_line.as_bytes()).await.expect("write good request failed");
+        client_writer.write_all(b"\n").await.expect("write good newline failed");
+        drop(client_writer);
+
+        let mut lines = BufReader::new(client_reader).lines();
+
+        let first_line = lines.next_line().await.expect("read first").expect("missing first");
+        let first_env: RpcEnvelope<DaemonResponse> =
+            serde_json::from_str(&first_line).expect("parse first env");
+        assert_eq!(first_env.request_id, bad_proto_id);
+        match first_env.payload {
+            DaemonResponse::Error { code, .. } => assert_eq!(code, "UNSUPPORTED_PROTOCOL"),
+            other => panic!("expected UNSUPPORTED_PROTOCOL, got {other:?}"),
+        }
+
+        let second_line = lines.next_line().await.expect("read second").expect("missing second");
+        let second_env: RpcEnvelope<DaemonResponse> =
+            serde_json::from_str(&second_line).expect("parse second env");
+        assert_eq!(second_env.request_id, good_id);
+        assert!(matches!(second_env.payload, DaemonResponse::Status(_)));
+
+        server_task.await.expect("server task join failed");
     }
 }

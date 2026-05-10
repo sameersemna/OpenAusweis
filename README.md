@@ -198,6 +198,19 @@ Firefox-only install helper:
 scripts/install-native-host-firefox.sh <FIREFOX_ADDON_ID> [BINARY_PATH]
 ```
 
+Browser-extension manifest target helpers:
+
+```bash
+# Chromium (manifest v3)
+npm run --workspace @openausweis/browser-extension build:chromium
+
+# Firefox (manifest v2)
+npm run --workspace @openausweis/browser-extension build:firefox
+```
+
+These commands copy either manifest.v3.json or manifest.v2.json into
+apps/browser-extension/manifest.json before running TypeScript checks.
+
 The packaging validator now prints actionable fix commands for each warning:
 
 ```bash

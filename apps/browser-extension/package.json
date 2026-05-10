@@ -4,7 +4,11 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "manifest:chromium": "cp manifest.v3.json manifest.json",
+    "manifest:firefox": "cp manifest.v2.json manifest.json",
     "build": "tsc --noEmit",
+    "build:chromium": "npm run manifest:chromium && npm run build",
+    "build:firefox": "npm run manifest:firefox && npm run build",
     "lint": "echo \"No linter configured yet\"",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"

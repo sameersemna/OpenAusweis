@@ -21,14 +21,36 @@
         --red: #8b2f2f;
         --red-bg: #fdf0f0;
         --red-border: #e8b3b3;
+        --focus: #0f6e83;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #1a1f24;
+          --surface: #252a30;
+          --text: #e0e6eb;
+          --muted: #a4adb5;
+          --border: #3a434d;
+          --primary: #7fc8d6;
+          --green: #6ab849;
+          --green-bg: #1f3122;
+          --green-border: #375f3d;
+          --amber: #e8cf98;
+          --amber-bg: #3a3225;
+          --amber-border: #6f5e3a;
+          --red: #f5a8a8;
+          --red-bg: #3f2525;
+          --red-border: #7a4444;
+          --focus: #98d6e2;
+        }
       }
       * { box-sizing: border-box; margin: 0; padding: 0; }
       body {
-        width: 280px;
+        width: 300px;
         font-family: "Segoe UI", system-ui, sans-serif;
         font-size: 13px;
         color: var(--text);
         background: var(--bg);
+        min-height: 280px;
       }
       header {
         display: flex;
@@ -43,17 +65,31 @@
         font-weight: 700;
       }
       #refresh-btn {
-        background: none;
-        border: none;
+        background: transparent;
+        border: 1px solid var(--border);
         cursor: pointer;
         color: var(--primary);
         font-size: 15px;
-        padding: 2px 4px;
+        padding: 3px 7px;
         border-radius: 4px;
         line-height: 1;
       }
       #refresh-btn:hover { background: #e3edf2; }
+      #refresh-btn:focus-visible,
+      button:focus-visible,
+      summary:focus-visible {
+        outline: 2px solid var(--focus);
+        outline-offset: 1px;
+      }
       .body { padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+      .section-title {
+        font-size: 11px;
+        font-weight: 600;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        padding: 0 1px;
+      }
       .row {
         display: flex;
         align-items: center;
@@ -93,6 +129,29 @@
         border-color: var(--red-border);
       }
       .badge.err::before { background: var(--red); }
+      .status-panel {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .session-panel {
+        border: 1px solid var(--border);
+        border-radius: 7px;
+        background: var(--surface);
+        padding: 8px 10px;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .session-meta {
+        display: flex;
+        justify-content: space-between;
+        gap: 8px;
+        font-size: 12px;
+      }
+      .session-meta-label {
+        color: var(--muted);
+      }
       .readers-section { display: flex; flex-direction: column; gap: 6px; }
       .readers-section .label {
         font-size: 11px;
@@ -138,14 +197,77 @@
         font-size: 12px;
         line-height: 1.4;
       }
+      details.diag {
+        border: 1px solid var(--border);
+        border-radius: 7px;
+        background: var(--surface);
+        overflow: hidden;
+      }
+      details.diag summary {
+        list-style: none;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 8px 10px;
+        user-select: none;
+      }
+      details.diag summary::-webkit-details-marker {
+        display: none;
+      }
+      .diag-body {
+        border-top: 1px solid var(--border);
+        padding: 8px;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .diag-controls {
+        display: flex;
+        justify-content: flex-end;
+      }
+      .diag-controls button {
+        border: 1px solid var(--border);
+        border-radius: 5px;
+        background: transparent;
+        color: var(--text);
+        padding: 4px 8px;
+        font-size: 12px;
+        cursor: pointer;
+      }
+      .guide {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        padding: 8px 10px;
+        border: 1px solid var(--amber-border);
+        border-radius: 7px;
+        background: var(--amber-bg);
+        color: var(--amber);
+      }
+      .guide strong {
+        font-size: 12px;
+      }
+      .sr-only {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+      }
     </style>
   </head>
   <body>
     <header>
       <h1>OpenAusweis</h1>
-      <button id="refresh-btn" title="Refresh status">&#8635;</button>
+      <button id="refresh-btn" title="Refresh status" aria-label="Refresh status">&#8635;</button>
     </header>
-    <div class="body" id="body">
+    <div id="status-live" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+    <div class="body" id="body" role="region" aria-label="OpenAusweis popup status">
       <div class="hint-note">Loading…</div>
     </div>
     <script src="popup.js"></script>
