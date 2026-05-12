@@ -19,9 +19,9 @@ describe("uxState", () => {
   });
 
   it("maps handoff status labels for active states", () => {
-    expect(handoffStatusLabelFromState(false, "IDLE")).toBe("Waiting to start");
+    expect(handoffStatusLabelFromState(false, "IDLE")).toBe("Waiting for browser sign-in");
     expect(handoffStatusLabelFromState(true, "PIN_ENTRY")).toBe("PIN confirmation needed");
-    expect(handoffStatusLabelFromState(true, "COMPLETED")).toBe("Browser can finish sign-in");
+    expect(handoffStatusLabelFromState(true, "COMPLETED")).toBe("Return to browser to finish");
   });
 
   it("increments completion and failure counters on transitions", () => {

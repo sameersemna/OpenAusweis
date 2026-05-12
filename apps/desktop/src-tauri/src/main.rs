@@ -37,9 +37,7 @@ const DAEMON_AUTOSTART_WAIT_POLL_MS: u64 = 125;
 const DEFAULT_ALLOWED_EXACT_ORIGINS: &[&str] = &["http://localhost", "https://localhost"];
 const DEFAULT_ALLOWED_SUFFIXES: &[&str] = &[".bundid.de", ".bund.de"];
 const MAIN_WINDOW_LABEL: &str = "main";
-const TRAY_ACTION_TOGGLE: &str = "toggle-window";
 const TRAY_ACTION_SHOW: &str = "show-window";
-const TRAY_ACTION_HIDE: &str = "hide-window";
 const TRAY_ACTION_QUIT: &str = "quit";
 
 #[derive(Debug)]
@@ -63,6 +61,8 @@ enum TrayHealthState {
 
 static LAST_TRAY_STATE: OnceLock<Mutex<TrayHealthState>> = OnceLock::new();
 static LAST_SESSION_NOTIFICATION_KEY: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static LAST_WINDOW_ATTENTION_KEY: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static CLOSE_TO_TRAY_HINT_SHOWN: OnceLock<Mutex<bool>> = OnceLock::new();
 
 fn tray_tooltip_for_state(state: &TrayHealthState) -> String {
     match state {
@@ -122,6 +122,10 @@ fn maybe_notify_auth_state(app: &AppHandle, update: &DesktopSessionUpdate) {
         return;
     }
 
+    if main_window_is_visible_and_focused(app) {
+        return;
+    }
+
     let state = update.state.as_deref().unwrap_or("IDLE");
     let session_id = update.session_id.as_deref().unwrap_or("none");
     let key = format!("{session_id}:{state}");
@@ -136,16 +140,16 @@ fn maybe_notify_auth_state(app: &AppHandle, update: &DesktopSessionUpdate) {
 
     let notification = match state {
         "PIN_ENTRY" => Some((
-            "OpenAusweis: PIN required",
-            "Enter your ID card PIN to continue secure sign-in.",
+            "PIN needed",
+            "Enter your card PIN to continue. Keep your card inserted.",
         )),
         "COMPLETED" => Some((
-            "OpenAusweis: Authentication complete",
-            "Return to your browser tab to finish sign-in.",
+            "Sign-in complete",
+            "Return to your browser tab to finish.",
         )),
         "ERROR" => Some((
-            "OpenAusweis: Authentication needs attention",
-            "Authentication could not be completed. Start again to retry.",
+            "Sign-in could not be completed",
+            "Open OpenAusweis and start again when you are ready.",
         )),
         _ => None,
     };
@@ -153,6 +157,39 @@ fn maybe_notify_auth_state(app: &AppHandle, update: &DesktopSessionUpdate) {
     if let Some((title, body)) = notification {
         let _ = app.notification().builder().title(title).body(body).show();
     }
+}
+
+fn maybe_focus_window_for_auth_state(app: &AppHandle, update: &DesktopSessionUpdate) {
+    if !update.connected {
+        return;
+    }
+
+    let state = update.state.as_deref().unwrap_or("IDLE");
+    if state != "PIN_ENTRY" {
+        return;
+    }
+
+    let session_id = update.session_id.as_deref().unwrap_or("none");
+    let key = format!("{session_id}:{state}");
+    let lock = LAST_WINDOW_ATTENTION_KEY.get_or_init(|| Mutex::new(None));
+    let mut last_key = lock.lock().expect("window attention lock poisoned");
+    if last_key.as_deref() == Some(key.as_str()) {
+        return;
+    }
+    *last_key = Some(key);
+    drop(last_key);
+
+    show_main_window(app);
+}
+
+fn main_window_is_visible_and_focused(app: &AppHandle) -> bool {
+    let Some(window) = with_main_window(app) else {
+        return false;
+    };
+
+    let visible = window.is_visible().unwrap_or(false);
+    let focused = window.is_focused().unwrap_or(false);
+    visible && focused
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -316,9 +353,66 @@ async fn submit_session_pin(session_id: String, pin: String) -> std::result::Res
             error,
             handoff_id,
         }),
-        DaemonResponse::Error { code, message } => Err(format!("daemon error {code}: {message}")),
+        DaemonResponse::Error { code, message } => Err(format_submit_pin_error(&code, &message)),
         other => Err(format!("unexpected daemon response: {other:?}")),
     }
+}
+
+fn format_submit_pin_error(code: &str, message: &str) -> String {
+    if code == "INVALID_PIN" {
+        if let Some(remaining_attempts) = parse_remaining_attempts(message) {
+            return format!(
+                "Enter your 6-digit PIN. {remaining_attempts} attempt{} remaining.",
+                if remaining_attempts == 1 { "" } else { "s" }
+            );
+        }
+
+        if message.contains("too many invalid PIN attempts") {
+            return "Too many incorrect PIN entries. Start again to request a new sign-in.".to_string();
+        }
+
+        if message.contains("session not found") {
+            return "This sign-in request is no longer active. Start again from your browser.".to_string();
+        }
+    }
+
+    format!("daemon error {code}: {message}")
+}
+
+fn parse_remaining_attempts(message: &str) -> Option<u8> {
+    let marker = "remaining attempts: ";
+    let start = message.find(marker)? + marker.len();
+    let digits: String = message[start..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+
+    digits.parse().ok()
+}
+
+fn maybe_notify_close_to_tray(app: &AppHandle) {
+    let lock = CLOSE_TO_TRAY_HINT_SHOWN.get_or_init(|| Mutex::new(false));
+    let mut shown = lock.lock().expect("close-to-tray hint lock poisoned");
+    if !mark_close_to_tray_hint_shown(&mut shown) {
+        return;
+    }
+    drop(shown);
+
+    let _ = app
+        .notification()
+        .builder()
+        .title("OpenAusweis is still running")
+        .body("The window was closed, but OpenAusweis remains available in the system tray.")
+        .show();
+}
+
+fn mark_close_to_tray_hint_shown(shown: &mut bool) -> bool {
+    if *shown {
+        return false;
+    }
+
+    *shown = true;
+    true
 }
 
 #[tauri::command]
@@ -380,6 +474,7 @@ fn detect_runtime_context() -> DesktopRuntimeContext {
         && session_type.as_deref() == Some("wayland")
     {
         notes.push("GNOME Wayland may require AppIndicator support for persistent tray visibility.".to_string());
+        notes.push("OpenAusweis uses desktop notifications as calm fallback cues when tray visibility is limited.".to_string());
     }
 
     DesktopRuntimeContext {
@@ -1058,6 +1153,7 @@ async fn stream_daemon_sessions_once(app: &AppHandle) -> Result<()> {
         .context("failed to read daemon session stream response")?
     {
         let update = parse_session_stream_response_line(request_id, &line)?;
+        maybe_focus_window_for_auth_state(app, &update);
         maybe_notify_auth_state(app, &update);
         app.emit(DAEMON_SESSION_EVENT, update)
             .context("failed to emit daemon session event")?;
@@ -1180,12 +1276,6 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
-fn hide_main_window(app: &AppHandle) {
-    if let Some(window) = with_main_window(app) {
-        let _ = window.hide();
-    }
-}
-
 fn toggle_main_window(app: &AppHandle) {
     if let Some(window) = with_main_window(app) {
         match window.is_visible() {
@@ -1207,12 +1297,10 @@ fn toggle_main_window(app: &AppHandle) {
 }
 
 fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
-    let toggle_item =
-        MenuItem::with_id(app, TRAY_ACTION_TOGGLE, "Open/Hide OpenAusweis", true, None::<&str>)?;
-    let show_item = MenuItem::with_id(app, TRAY_ACTION_SHOW, "Open OpenAusweis", true, None::<&str>)?;
-    let hide_item = MenuItem::with_id(app, TRAY_ACTION_HIDE, "Hide window", true, None::<&str>)?;
-    let quit_item = MenuItem::with_id(app, TRAY_ACTION_QUIT, "Quit", true, None::<&str>)?;
-    let tray_menu = Menu::with_items(app, &[&toggle_item, &show_item, &hide_item, &quit_item])?;
+    let open_item =
+        MenuItem::with_id(app, TRAY_ACTION_SHOW, "Open OpenAusweis", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, TRAY_ACTION_QUIT, "Quit OpenAusweis", true, None::<&str>)?;
+    let tray_menu = Menu::with_items(app, &[&open_item, &quit_item])?;
 
     TrayIconBuilder::with_id("main")
         .menu(&tray_menu)
@@ -1220,9 +1308,7 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(move |app_handle, event| {
             match event.id().as_ref() {
-                TRAY_ACTION_TOGGLE => toggle_main_window(app_handle),
                 TRAY_ACTION_SHOW => show_main_window(app_handle),
-                TRAY_ACTION_HIDE => hide_main_window(app_handle),
                 TRAY_ACTION_QUIT => app_handle.exit(0),
                 _ => {}
             }
@@ -1249,6 +1335,7 @@ fn main() {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
+                maybe_notify_close_to_tray(&window.app_handle());
             }
         })
         .setup(|app| {
@@ -1399,6 +1486,57 @@ mod tests {
             message,
             "daemon error SESSION_ALREADY_ACTIVE: a session is already active"
         );
+    }
+
+    #[test]
+    fn parse_remaining_attempts_extracts_numeric_value() {
+        let remaining = parse_remaining_attempts("PIN must be exactly 6 digits (remaining attempts: 2)");
+        assert_eq!(remaining, Some(2));
+    }
+
+    #[test]
+    fn format_submit_pin_error_maps_remaining_attempts_to_calm_guidance() {
+        let message = format_submit_pin_error(
+            "INVALID_PIN",
+            "PIN must be exactly 6 digits (remaining attempts: 2)",
+        );
+
+        assert_eq!(message, "Enter your 6-digit PIN. 2 attempts remaining.");
+    }
+
+    #[test]
+    fn format_submit_pin_error_maps_too_many_attempts_to_restart_guidance() {
+        let message = format_submit_pin_error("INVALID_PIN", "too many invalid PIN attempts");
+        assert_eq!(
+            message,
+            "Too many incorrect PIN entries. Start again to request a new sign-in."
+        );
+    }
+
+    #[test]
+    fn format_submit_pin_error_maps_session_not_found_to_restart_guidance() {
+        let message = format_submit_pin_error("INVALID_PIN", "session not found");
+        assert_eq!(
+            message,
+            "This sign-in request is no longer active. Start again from your browser."
+        );
+    }
+
+    #[test]
+    fn mark_close_to_tray_hint_shown_returns_true_only_once() {
+        let mut shown = false;
+
+        assert!(mark_close_to_tray_hint_shown(&mut shown));
+        assert!(shown);
+        assert!(!mark_close_to_tray_hint_shown(&mut shown));
+    }
+
+    #[test]
+    fn mark_close_to_tray_hint_shown_preserves_existing_shown_state() {
+        let mut shown = true;
+
+        assert!(!mark_close_to_tray_hint_shown(&mut shown));
+        assert!(shown);
     }
 
     #[test]

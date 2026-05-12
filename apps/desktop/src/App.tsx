@@ -195,6 +195,16 @@ export function App() {
     );
   }, [diagnosticsDrawerOpen]);
 
+  // Auto-dismiss tray action confirmation after 5 s so it does not linger.
+  useEffect(() => {
+    if (!trayActionMessage) {
+      return;
+    }
+
+    const timer = setTimeout(() => setTrayActionMessage(null), 5000);
+    return () => clearTimeout(timer);
+  }, [trayActionMessage]);
+
   useEffect(() => {
     void loadPolicy();
     void loadRuntimeContext();
@@ -202,17 +212,33 @@ export function App() {
 
   useEffect(() => {
     if (sessionUpdate.state === "COMPLETED") {
-      setSessionResultMessage("Sign-in completed successfully.");
+      setSessionResultMessage("Sign-in complete. Return to your browser to finish.");
       setSessionCompletedAt(new Date().toLocaleTimeString());
     }
 
     if (sessionUpdate.state === "ERROR") {
       setSessionResultMessage(
-        sessionUpdate.error ? `Sign-in failed: ${sessionUpdate.error}` : "Sign-in failed."
+        sessionUpdate.error
+          ? `Sign-in could not be completed: ${readableSessionError(sessionUpdate.error)}`
+          : "Sign-in could not be completed."
       );
       setSessionCompletedAt(new Date().toLocaleTimeString());
     }
   }, [sessionUpdate.state, sessionUpdate.sessionId, sessionUpdate.error]);
+
+  useEffect(() => {
+    if (!sessionResultMessage) {
+      return;
+    }
+
+    const timeoutMs = sessionUpdate.state === "ERROR" ? 12000 : 7000;
+    const timer = setTimeout(() => {
+      setSessionResultMessage(null);
+      setSessionCompletedAt(null);
+    }, timeoutMs);
+
+    return () => clearTimeout(timer);
+  }, [sessionResultMessage, sessionUpdate.state]);
 
   useEffect(() => {
     if (sessionUpdate.state === "PIN_ENTRY") {
@@ -476,6 +502,18 @@ export function App() {
     }
   }
 
+  async function handleStartAgainFromRecovery() {
+    if (sessionUpdate.sessionId) {
+      try {
+        await invoke("cancel_session", { sessionId: sessionUpdate.sessionId });
+      } catch {
+        // Continue with a fresh start attempt even if explicit cancel is no longer needed.
+      }
+    }
+
+    await handleStartBrowserAuthentication();
+  }
+
   function createDesktopHandoffId(): string {
     const random = Math.random().toString(16).slice(2, 10);
     return `desktop-${Date.now()}-${random}`;
@@ -538,18 +576,25 @@ export function App() {
   }
 
   function sessionStateHint(): string {
+    if (!sessionUpdate.sessionId) {
+      if (status !== "Connected") {
+        return "OpenAusweis is reconnecting in the background.";
+      }
+      return "Waiting for sign-in request from your browser.";
+    }
+
     switch (sessionUpdate.state) {
       case "PIN_ENTRY":
-        return "PIN entry requested. Enter your card PIN to continue in the browser.";
+        return "PIN needed. Enter your card PIN to continue.";
       case "CARD_INTERACTION":
-        return "Identity card verification in progress. Keep your card inserted until your browser confirms success.";
+        return "Verification in progress. Keep your card inserted until your browser confirms completion.";
       case "COMPLETED":
         return "Sign-in complete. Return to your browser tab to finish.";
       case "ERROR":
-        return "Sign-in could not be completed. Start again to retry.";
+        return "Sign-in could not be completed. Start again when you are ready.";
       case "IDLE":
       default:
-        return "No sign-in is currently running.";
+        return "Waiting for sign-in request from your browser.";
     }
   }
 
@@ -576,7 +621,7 @@ export function App() {
 
   function currentRequestTitle(): string {
     if (!sessionUpdate.sessionId) {
-      return "No sign-in in progress";
+      return "Waiting for sign-in";
     }
 
     switch (sessionUpdate.state) {
@@ -590,23 +635,27 @@ export function App() {
         return "Sign-in needs attention";
       case "IDLE":
       default:
-        return "Sign-in request started";
+        return "Preparing sign-in";
     }
   }
 
   function currentRequestActionHint(): string {
+    if (!sessionUpdate.sessionId) {
+      return "Start sign-in from your browser when you are ready.";
+    }
+
     switch (sessionUpdate.state) {
       case "PIN_ENTRY":
-        return "Enter your 6-digit PIN in the prompt and keep your card inserted.";
+        return "Enter your 6-digit PIN here, then keep your card inserted.";
       case "CARD_INTERACTION":
-        return "Please wait. Keep card and reader connected until completion.";
+        return "Verification in progress. Keep your card and reader connected.";
       case "COMPLETED":
         return "Go back to your browser tab to complete sign-in.";
       case "ERROR":
-        return "Start a new sign-in attempt.";
+        return "Use Start again for a fresh sign-in attempt.";
       case "IDLE":
       default:
-        return "Start sign-in when your card and reader are ready.";
+        return "Waiting for your browser sign-in request.";
     }
   }
 
@@ -632,7 +681,7 @@ export function App() {
     }
 
     if (runtimeContext.sessionType === "wayland") {
-      return "Tray behavior depends on your desktop shell. Open Advanced if tray visibility seems limited.";
+      return "Tray behavior depends on your desktop shell. If tray visibility is limited, OpenAusweis uses notifications as fallback cues.";
     }
 
     if (runtimeContext.sessionType === "x11") {
@@ -643,6 +692,18 @@ export function App() {
   }
 
   function primaryStatusLabel(): string {
+    if (sessionUpdate.state === "PIN_ENTRY") {
+      return "PIN required to continue";
+    }
+    if (sessionUpdate.state === "CARD_INTERACTION") {
+      return "Sign-in in progress";
+    }
+    if (sessionUpdate.state === "COMPLETED") {
+      return "Sign-in complete";
+    }
+    if (sessionUpdate.state === "ERROR") {
+      return "Sign-in needs attention";
+    }
     if (status !== "Connected") {
       return "OpenAusweis is reconnecting";
     }
@@ -659,6 +720,12 @@ export function App() {
   }
 
   function primaryStatusTone(): "ok" | "warn" | "bad" {
+    if (sessionUpdate.state === "ERROR") {
+      return "bad";
+    }
+    if (sessionUpdate.state === "PIN_ENTRY" || sessionUpdate.state === "CARD_INTERACTION") {
+      return "ok";
+    }
     if (status !== "Connected" || !pcscAvailable) {
       return "bad";
     }
@@ -898,10 +965,14 @@ export function App() {
               ) : null}
             </section>
 
-            <section className="session-panel">
+            <section className="session-panel" data-session-state={sessionUpdate.state ?? "IDLE"}>
               <h2>Current sign-in</h2>
-              <div className="request-card" role="status" aria-live="polite">
-                <p className="request-title">{currentRequestTitle()}</p>
+              <div className="request-card" role="status" aria-live="polite" aria-busy={sessionUpdate.state === "CARD_INTERACTION"}>
+                <p className="request-title">
+                  {sessionUpdate.state === "CARD_INTERACTION" ? (
+                    <><span className="breathe-dot" aria-hidden="true" />{currentRequestTitle()}</>
+                  ) : currentRequestTitle()}
+                </p>
                 <div className="status-row session-row">
                   <span className="label">Sign-in progress</span>
                   <span className="value">{handoffStatusLabelFromState(Boolean(sessionUpdate.sessionId), sessionUpdate.state)}</span>
@@ -917,7 +988,7 @@ export function App() {
                   <div className="actions error-recovery-actions">
                     <button
                       type="button"
-                      onClick={handleStartBrowserAuthentication}
+                      onClick={handleStartAgainFromRecovery}
                       disabled={!canStartAuthentication}
                     >
                       Start again
@@ -925,6 +996,11 @@ export function App() {
                   </div>
                 ) : null}
               </div>
+              {sessionUpdate.state === "COMPLETED" ? (
+                <div className="return-to-browser-panel" role="status" aria-live="polite">
+                  Your browser is ready — switch back to complete sign-in.
+                </div>
+              ) : null}
               {sessionUpdate.error ? (
                 <p className="reader-error" role="alert">{readableSessionError(sessionUpdate.error)}</p>
               ) : null}

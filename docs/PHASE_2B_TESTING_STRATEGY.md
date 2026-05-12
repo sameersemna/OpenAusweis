@@ -421,6 +421,30 @@ test("end-to-end browser authentication", async ({ browser }) => {
 ./scripts/validate-linux-packaging.sh --expect-chromium-id ABCD... --expect-firefox-id openausweis@...
 ```
 
+### Desktop Polish Verification Matrix
+
+**Scope:** PHASE 2B.3 interaction polish only. These checks validate calm idle behavior, focused browser handoff, reassuring recovery, restrained notifications, and Linux-native tray/window behavior without requiring architecture changes.
+
+| Area | Environment | Expected behavior |
+|------|-------------|-------------------|
+| Idle state | GNOME/X11, GNOME/Wayland, KDE/X11, KDE/Wayland | Home view stays visually calm, shows readiness summary, and does not show technical diagnostics in primary view |
+| Browser handoff | Any supported desktop session | Desktop switches from idle to PIN-required or in-progress state with one clear next action |
+| Recovery | Any supported desktop session | PIN and session failures produce plain-language retry guidance without raw backend wording |
+| Tray behavior | Tray available | Closing the window keeps the app running and accessible from tray |
+| Tray fallback | GNOME/Wayland or limited tray shell | Desktop notifications provide limited fallback cues without repeated spam |
+
+**Manual checklist:**
+1. Launch the desktop app with no active session and verify Home says it is waiting for browser sign-in rather than showing a warning or technical details.
+2. Disconnect the daemon or stop it briefly and verify Home shows a reconnecting state rather than surfacing internal transport language.
+3. Start a browser sign-in and verify the desktop app moves into PIN-required or sign-in-in-progress state with only one primary action visible.
+4. When PIN entry is requested while the window is hidden, verify the main window is shown once and not repeatedly stolen to front during the same prompt.
+5. Close the desktop window and verify OpenAusweis stays running, the tray remains available when supported, and the close-to-tray reminder appears only once per app run.
+6. On GNOME/Wayland, verify tray limitations do not cause repeated alerts and that notifications are used only for important transitions.
+7. Submit an invalid short PIN and verify the desktop shows plain-language guidance including remaining attempts.
+8. Exhaust invalid PIN attempts and verify the desktop tells the user to start again rather than exposing backend phrases like `INVALID_PIN` or `SESSION_NOT_FOUND`.
+9. Complete a sign-in and verify the desktop shows a calm completion cue that directs the user back to the browser.
+10. After completion or recovery, verify the Home view settles back into a calm idle/waiting presentation without lingering urgent messaging.
+
 ### Snap Build & Runtime
 
 **Test Environment:** Ubuntu 24.04 with snapd

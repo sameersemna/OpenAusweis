@@ -252,7 +252,9 @@ h4 {
   border-radius: var(--radius-lg);
   border: 1px solid var(--border);
   padding: var(--space-5);
-  transition: background var(--dur-slow) var(--ease-in-out);
+  transition:
+    background var(--dur-slow) var(--ease-in-out),
+    border-color var(--dur-slow) var(--ease-in-out);
 }
 
 .tone-ok {
@@ -453,6 +455,22 @@ h4 {
   padding-top: 1rem;
 }
 
+.session-panel {
+  transition: opacity var(--dur-base) var(--ease-out);
+}
+
+.session-panel[data-session-state="CARD_INTERACTION"] .request-card {
+  border-color: var(--ring);
+}
+
+.session-panel[data-session-state="COMPLETED"] .request-card {
+  border-color: var(--badge-present-border);
+}
+
+.session-panel[data-session-state="ERROR"] .request-card {
+  border-color: #f0b4b4;
+}
+
 .status-row {
   margin-top: var(--space-4);
   display: flex;
@@ -577,6 +595,43 @@ h4 {
   to { transform: rotate(360deg); }
 }
 
+/* Calm pulse for in-progress card interaction */
+@keyframes breathe {
+  0%, 100% { opacity: 0.4; }
+  50%       { opacity: 1;   }
+}
+
+.breathe-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--primary);
+  animation: breathe 2.4s ease-in-out infinite;
+  flex-shrink: 0;
+  vertical-align: middle;
+  margin-right: 0.45rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .breathe-dot {
+    animation: none;
+    opacity: 0.65;
+  }
+}
+
+.return-to-browser-panel {
+  margin-top: var(--space-3);
+  border: 1px solid var(--badge-present-border);
+  border-radius: var(--radius-sm);
+  background: var(--badge-present-bg);
+  padding: var(--space-3) var(--space-4);
+  font-size: var(--text-sm);
+  font-weight: 500;
+  color: var(--badge-present-text);
+  animation: slide-up var(--dur-slow) var(--ease-out);
+}
+
 .btn-spinner {
   display: inline-block;
   width: 0.8em;
@@ -584,7 +639,7 @@ h4 {
   border: 2px solid currentColor;
   border-right-color: transparent;
   border-radius: 50%;
-  animation: spin 0.6s linear infinite;
+  animation: spin 1s linear infinite;
   margin-right: 0.4em;
   vertical-align: -0.1em;
   flex-shrink: 0;
@@ -814,7 +869,7 @@ button:disabled {
 }
 
 @keyframes slide-up {
-  from { opacity: 0; transform: translateY(8px) scale(0.98); }
+  from { opacity: 0; transform: translateY(4px) scale(0.995); }
   to   { opacity: 1; transform: translateY(0) scale(1); }
 }
 

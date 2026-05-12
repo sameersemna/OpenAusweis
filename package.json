@@ -17,6 +17,7 @@
     "setup-native-host": "./scripts/setup-native-host.sh",
     "validate:linux-packaging": "./scripts/validate-linux-packaging.sh",
     "validate:linux-packaging:expected": "./scripts/validate-linux-packaging.sh --expect-chromium-id \"$OPENAUSWEIS_EXPECTED_CHROMIUM_EXTENSION_ID\" --expect-firefox-id \"$OPENAUSWEIS_EXPECTED_FIREFOX_ADDON_ID\"",
+    "validate:desktop-polish": "./scripts/validate-desktop-polish.sh",
     "lint": "npm run --workspaces --if-present lint",
     "test": "npm run --workspaces --if-present test",
     "typecheck": "npm run --workspaces --if-present typecheck"

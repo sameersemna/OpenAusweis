@@ -134,7 +134,7 @@ export function handoffStatusLabelFromState(
   state: string | null | undefined
 ): string {
   if (!hasSessionId) {
-    return "Waiting to start";
+    return "Waiting for browser sign-in";
   }
 
   switch (state) {
@@ -143,11 +143,11 @@ export function handoffStatusLabelFromState(
     case "CARD_INTERACTION":
       return "Verifying in progress";
     case "COMPLETED":
-      return "Browser can finish sign-in";
+      return "Return to browser to finish";
     case "ERROR":
-      return "Retry needed";
+      return "Ready to start again";
     default:
-      return "Session created";
+      return "Sign-in preparing";
   }
 }
 
