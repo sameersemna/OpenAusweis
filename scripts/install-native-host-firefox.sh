@@ -58,6 +58,7 @@ install_for_firefox_path() {
 }
 
 install_for_firefox_path "$HOME/.mozilla/native-messaging-hosts" "Firefox"
+install_for_firefox_path "$HOME/snap/firefox/common/.mozilla/native-messaging-hosts" "Firefox (Snap)"
 install_for_firefox_path "$HOME/.var/app/org.mozilla.firefox/.mozilla/native-messaging-hosts" "Firefox (Flatpak)"
 
 echo ""

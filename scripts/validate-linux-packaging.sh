@@ -103,15 +103,38 @@ check_os_baseline() {
 
 check_desktop_session() {
   local desktop="${XDG_CURRENT_DESKTOP:-unknown}"
+  local desktop_family="unknown"
+
   if [[ "$desktop" == *GNOME* ]]; then
+    desktop_family="gnome"
     log_pass "GNOME desktop detected (${desktop})"
+  elif [[ "$desktop" == *KDE* || "$desktop" == *Plasma* ]]; then
+    desktop_family="kde"
+    log_pass "KDE Plasma desktop detected (${desktop})"
   else
-    log_warn "Non-GNOME desktop detected (${desktop}); tray behavior may vary"
+    log_warn "Unrecognized desktop detected (${desktop}); tray behavior may vary"
   fi
 
   local session_type="${XDG_SESSION_TYPE:-unknown}"
   if [[ "$session_type" == "wayland" ]]; then
     log_pass "Wayland session detected"
+    case "$desktop_family" in
+      gnome)
+        log_warn_fix \
+          "GNOME Wayland is the primary compatibility target; tray and focus behavior should be validated explicitly" \
+          "Run a GNOME Wayland validation pass and execute: npm run validate:desktop-polish"
+        ;;
+      kde)
+        log_warn_fix \
+          "KDE Wayland detected; validate tray visibility, attention requests, and browser handoff in Plasma" \
+          "Run a KDE Wayland validation pass and execute: npm run validate:desktop-polish"
+        ;;
+      *)
+        log_warn_fix \
+          "Wayland session detected with an unrecognized desktop shell; validate tray and focus behavior explicitly" \
+          "Run the desktop polish checklist in the exact target desktop session"
+        ;;
+    esac
   elif [[ "$session_type" == "x11" ]]; then
     log_warn_fix \
       "X11 session detected; Wayland compatibility not exercised" \
@@ -230,6 +253,7 @@ check_native_host_manifest() {
 
   local -a firefox_paths=(
     "$HOME/.mozilla/native-messaging-hosts/org.openausweis.native.json"
+    "$HOME/snap/firefox/common/.mozilla/native-messaging-hosts/org.openausweis.native.json"
     "$HOME/.var/app/org.mozilla.firefox/.mozilla/native-messaging-hosts/org.openausweis.native.json"
   )
 
@@ -308,6 +332,34 @@ check_native_host_manifest() {
   if [[ -n "$EXPECTED_FIREFOX_ID" && $found_firefox -eq 0 ]]; then
     log_fail "Expected Firefox add-on ID provided, but no Firefox native host manifest was found"
   fi
+}
+
+check_browser_runtime_paths() {
+  local -a browsers=(
+    "firefox:Firefox:$HOME/.mozilla/native-messaging-hosts/org.openausweis.native.json:$HOME/snap/firefox/common/.mozilla/native-messaging-hosts/org.openausweis.native.json:$HOME/.var/app/org.mozilla.firefox/.mozilla/native-messaging-hosts/org.openausweis.native.json"
+    "chromium:Chromium:$HOME/.config/chromium/NativeMessagingHosts/org.openausweis.native.json"
+    "google-chrome:Google Chrome:$HOME/.config/google-chrome/NativeMessagingHosts/org.openausweis.native.json"
+    "brave-browser:Brave:$HOME/.config/BraveSoftware/Brave-Browser/NativeMessagingHosts/org.openausweis.native.json"
+  )
+
+  for browser_spec in "${browsers[@]}"; do
+    IFS=: read -r command name primary_manifest fallback_manifest <<< "$browser_spec"
+    if command -v "$command" >/dev/null 2>&1; then
+      log_pass "$name command available ($command)"
+
+      if [[ -f "$primary_manifest" ]]; then
+        log_pass "$name native messaging manifest present: $primary_manifest"
+      elif [[ -n "${fallback_manifest:-}" && -f "$fallback_manifest" ]]; then
+        log_pass "$name native messaging manifest present: $fallback_manifest"
+      else
+        log_warn_fix \
+          "$name command is present but no native messaging manifest was found in the expected locations" \
+          "Run scripts/setup-native-host.sh with the browser ID and re-run validation"
+      fi
+    else
+      log_warn "$name command not found; cannot validate browser/runtime integration for this browser"
+    fi
+  done
 }
 
 check_daemon_socket_layout() {
@@ -465,6 +517,7 @@ main() {
   check_os_baseline
   check_desktop_session
   check_native_host_manifest
+  check_browser_runtime_paths
   check_daemon_socket_layout
   check_smartcard_runtime
   check_snap_flatpak

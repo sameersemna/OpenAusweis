@@ -6,6 +6,13 @@ desktop_env="${XDG_CURRENT_DESKTOP:-unknown}"
 session_type="${XDG_SESSION_TYPE:-unknown}"
 runtime_dir="${XDG_RUNTIME_DIR:-unset}"
 
+desktop_family="unknown"
+if [[ "$desktop_env" == *GNOME* ]]; then
+  desktop_family="gnome"
+elif [[ "$desktop_env" == *KDE* || "$desktop_env" == *Plasma* ]]; then
+  desktop_family="kde"
+fi
+
 desktop_app_running="no"
 daemon_running="no"
 
@@ -22,6 +29,7 @@ OpenAusweis Desktop Polish Validation
 
 Environment
 - Desktop: ${desktop_env}
+- Desktop family: ${desktop_family}
 - Session: ${session_type}
 - XDG runtime dir: ${runtime_dir}
 - Desktop app running: ${desktop_app_running}
